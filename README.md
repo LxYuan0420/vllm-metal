@@ -32,7 +32,6 @@ scripts/ci.sh  # This will setup the dev environment
 
 ## Requirements
 
-- macOS 12.3 or later
 - Apple Silicon Mac
 - Python 3.11 or later
 - vLLM 0.12.0 or later
@@ -79,24 +78,6 @@ python -m vllm.entrypoints.openai.api_server \
 2. **Adjust Memory Fraction**: If you encounter OOM errors, reduce `VLLM_METAL_MEMORY_FRACTION`
 3. **Batch Size**: Larger batch sizes can improve throughput
 4. **Model Size**: Unified memory allows larger models than discrete GPU memory
-
-## Troubleshooting
-
-### MPS Not Available
-
-```
-RuntimeError: Metal/MPS backend not available
-```
-
-Ensure you're running on Apple Silicon and have macOS 12.3+ installed.
-
-### Out of Memory
-
-```
-RuntimeError: MPS backend out of memory
-```
-
-Try reducing `VLLM_METAL_MEMORY_FRACTION` or using a smaller model.
 
 ### Slow Performance
 
