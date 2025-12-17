@@ -29,6 +29,7 @@ ensure_uv() {
       error "Failed to install uv"
       return 1
     fi
+
     # Add uv to PATH for this session
     export PATH="$HOME/.local/bin:$PATH"
   fi
