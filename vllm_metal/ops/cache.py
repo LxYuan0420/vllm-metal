@@ -26,7 +26,6 @@ def reshape_and_cache(
         k_scale: Key scaling factor
         v_scale: Value scaling factor
     """
-    num_tokens = key.shape[0]
     block_size = key_cache.shape[1]
 
     # Apply scaling if needed
@@ -35,14 +34,14 @@ def reshape_and_cache(
     if v_scale != 1.0:
         value = value * v_scale
 
-    # Store each token into its slot
-    for i in range(num_tokens):
-        slot = int(slot_mapping[i].item())
-        block_idx = slot // block_size
-        block_offset = slot % block_size
+    # Compute block indices and offsets vectorized (on GPU, no .item() calls)
+    block_indices = slot_mapping // block_size
+    block_offsets = slot_mapping % block_size
 
-        key_cache[block_idx, block_offset] = key[i]
-        value_cache[block_idx, block_offset] = value[i]
+    # Use advanced indexing to scatter key/value into cache slots
+    # key_cache shape: [num_blocks, block_size, num_kv_heads, head_size]
+    key_cache[block_indices, block_offsets] = key
+    value_cache[block_indices, block_offsets] = value
 
 
 def reshape_and_cache_flash(
@@ -67,7 +66,6 @@ def reshape_and_cache_flash(
         k_scale: Key scaling factor
         v_scale: Value scaling factor
     """
-    num_tokens = key.shape[0]
     block_size = kv_cache.shape[2]
 
     # Apply scaling if needed
@@ -76,14 +74,14 @@ def reshape_and_cache_flash(
     if v_scale != 1.0:
         value = value * v_scale
 
-    # Store each token into its slot
-    for i in range(num_tokens):
-        slot = int(slot_mapping[i].item())
-        block_idx = slot // block_size
-        block_offset = slot % block_size
+    # Compute block indices and offsets vectorized (on GPU)
+    block_indices = slot_mapping // block_size
+    block_offsets = slot_mapping % block_size
 
-        kv_cache[block_idx, 0, block_offset] = key[i]
-        kv_cache[block_idx, 1, block_offset] = value[i]
+    # Use advanced indexing to scatter key/value into cache slots
+    # kv_cache shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
+    kv_cache[block_indices, 0, block_offsets] = key
+    kv_cache[block_indices, 1, block_offsets] = value
 
 
 def copy_blocks(

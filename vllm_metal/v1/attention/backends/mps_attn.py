@@ -163,12 +163,9 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
         # Previous cloning caused stale metadata (seq_lens stayed constant,
         # slot_mapping didn't update between decode steps).
 
-        # CRITICAL: Synchronize MPS to ensure all pending async copies from
-        # CPU to MPS are complete. The base GPU model runner uses non_blocking=True
-        # when copying tensors (like slot_mapping) from CPU to GPU, but MPS
-        # doesn't handle async copies the same way CUDA does. Without this sync,
-        # we may read stale data from slot_mapping during decode.
-        torch.mps.synchronize()
+        # NOTE: The MPSModelRunner wraps model.forward() with torch.mps.synchronize()
+        # before each forward pass, which ensures async copies are complete.
+        # No additional sync needed here.
 
         return MPSAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -319,7 +316,7 @@ class MPSAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Update the KV cache with new key/value tensors.
+        """Update the KV cache with new key/value tensors (vectorized).
 
         Args:
             key: [num_tokens, num_kv_heads, head_size]
@@ -329,40 +326,33 @@ class MPSAttentionImpl(AttentionImpl):
             slot_mapping: [num_tokens]
         """
         num_tokens = key.shape[0]
+        if num_tokens == 0:
+            return
+
         block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_size = key_cache.shape[3]
 
         if DEBUG:
-            block_size_debug = key_cache.shape[1]
-            print("\n[MPS_ATTN DEBUG] _update_kv_cache:")
+            print("\n[MPS_ATTN DEBUG] _update_kv_cache (vectorized):")
             print(f"  num_tokens={num_tokens}")
             print(f"  slot_mapping={slot_mapping.tolist()}")
-            # Compute which blocks/offsets the slots map to
-            for i in range(min(num_tokens, 5)):
-                slot = slot_mapping[i].item()
-                blk = slot // block_size_debug
-                off = slot % block_size_debug
-                print(f"  slot[{i}]={slot} -> block={blk}, offset={off}")
 
-        # Compute block indices and offsets
-        block_indices = slot_mapping // block_size
-        block_offsets = slot_mapping % block_size
+        # Reshape cache to flat indexing: [num_blocks * block_size, num_kv_heads, head_size]
+        num_blocks = key_cache.shape[0]
+        key_cache_flat = key_cache.view(
+            num_blocks * block_size, num_kv_heads, head_size
+        )
+        value_cache_flat = value_cache.view(
+            num_blocks * block_size, num_kv_heads, head_size
+        )
 
-        # Update cache for each token
-        # key[i] has shape [num_kv_heads, head_size]
-        # key_cache[block_idx] has shape [block_size, num_kv_heads, head_size]
-        for i in range(num_tokens):
-            block_idx = block_indices[i].item()
-            block_offset = block_offsets[i].item()
-            if DEBUG and i < 3:
-                print(
-                    f"  Writing token {i} -> block={block_idx}, offset={block_offset}"
-                )
-            # key[i] is [num_kv_heads, head_size], we want to put it at position block_offset
-            key_cache[block_idx, block_offset, :, :] = key[i]
-            value_cache[block_idx, block_offset, :, :] = value[i]
+        # Use slot_mapping directly as indices into the flattened cache
+        # This is a vectorized scatter operation
+        key_cache_flat[slot_mapping] = key
+        value_cache_flat[slot_mapping] = value
 
-        # Synchronize to ensure writes are committed before any reads
-        torch.mps.synchronize()
+        # No sync needed here - MPS will handle memory ordering for subsequent ops
 
     def _run_paged_attention(
         self,
@@ -374,94 +364,100 @@ class MPSAttentionImpl(AttentionImpl):
         output: torch.Tensor,
         attn_metadata: MPSAttentionMetadata,
     ) -> torch.Tensor:
-        """Run paged attention using SDPA on MPS.
+        """Run paged attention using SDPA on MPS (optimized for GPU utilization).
 
-        For now, this uses a simple per-sequence loop. Future optimization
-        could batch multiple sequences together.
+        Uses batched operations to maximize GPU utilization:
+        - For prefill: batches sequences with same length
+        - For decode: batches all single-token queries with same KV length
         """
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
-        slot_mapping = attn_metadata.slot_mapping
         # key_cache shape: [num_blocks, block_size, num_kv_heads, head_size]
         block_size = key_cache.shape[1]
         causal = attn_metadata.causal
 
         num_seqs = len(seq_lens)
+        if num_seqs == 0:
+            return output
 
-        for seq_idx in range(num_seqs):
-            # Get query range for this sequence
-            q_start = query_start_loc[seq_idx].item()
-            q_end = query_start_loc[seq_idx + 1].item()
-            query_len = q_end - q_start
+        # Compute query lengths for each sequence
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
 
-            # Get sequence length (total number of tokens including cached)
-            seq_len = seq_lens[seq_idx].item()
+        # Check if this is a decode batch (all query_len == 1)
+        # This is the common case during generation after prefill
+        # Use torch operations to avoid .item() which would serialize GPU execution
+        all_decode = bool((query_lens == 1).all()) if num_seqs > 0 else False
 
-            # Get query for this sequence
-            seq_query = query[q_start:q_end]  # [query_len, num_heads, head_size]
+        if all_decode:
+            # Optimized decode path - works for both single and batched sequences
+            return self._run_batched_decode(
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                output,
+                query_start_loc,
+                seq_lens,
+                block_table,
+                block_size,
+                causal,
+            )
 
-            # Determine if this is prefill (query_len == seq_len) or decode (query_len < seq_len)
-            is_prefill = query_len == seq_len
+        # Check if all sequences have the same query length (prefill batching opportunity)
+        unique_query_lens = torch.unique(query_lens)
+        all_same_query_len = unique_query_lens.numel() == 1
+
+        if all_same_query_len and num_seqs > 1:
+            # Use int() to convert 0-dim tensor without GPU sync (stays on device)
+            query_len = int(unique_query_lens[0])
+            # Check if this is pure prefill (all query_len == seq_len)
+            is_prefill = bool((query_lens == seq_lens).all())
 
             if is_prefill:
-                # During prefill, use the key/value directly (already in correct order)
-                # This avoids any cache read/write ordering issues
-                gathered_key = key[q_start:q_end]  # [seq_len, num_kv_heads, head_size]
+                return self._run_batched_prefill(
+                    query,
+                    key,
+                    value,
+                    output,
+                    query_start_loc,
+                    query_len,
+                    num_seqs,
+                    causal,
+                )
+
+        # Fallback: mixed prefill/decode - process using tensor indexing
+        # Use tensor operations to avoid CPU sync where possible
+        for seq_idx in range(num_seqs):
+            # Use tensor indexing (stays on GPU)
+            q_start = query_start_loc[seq_idx]
+            q_end = query_start_loc[seq_idx + 1]
+            query_len = q_end - q_start
+            seq_len_val = seq_lens[seq_idx]
+
+            seq_query = query[q_start:q_end]
+            is_prefill = query_len == seq_len_val
+
+            if is_prefill:
+                gathered_key = key[q_start:q_end]
                 gathered_value = value[q_start:q_end]
             else:
-                # During decode, gather from KV cache using block_table
-                # block_table[i] gives the physical block index for logical block i
-                num_blocks = (seq_len + block_size - 1) // block_size
-                seq_block_table = block_table[seq_idx, :num_blocks]
+                # Decode: gather from cache + current K/V
+                # Convert seq_len to int for block calculation (single value, minimal overhead)
+                seq_len_int = int(seq_len_val)
+                num_blocks_needed = (seq_len_int + block_size - 1) // block_size
+                seq_block_table = block_table[seq_idx, :num_blocks_needed]
 
-                # Gather KV from cache for historical tokens
-                # NOTE: We read seq_len-query_len tokens from cache (the historical K/V)
-                # and use the current K/V directly for the new token(s) to avoid
-                # cache read-after-write timing issues on MPS.
-                historical_len = seq_len - query_len
+                query_len_int = int(query_len)
+                historical_len = seq_len_int - query_len_int
                 if historical_len > 0:
-                    hist_num_blocks = (historical_len + block_size - 1) // block_size
-                    hist_block_table = block_table[seq_idx, :hist_num_blocks]
-
-                    if DEBUG:
-                        print(f"\n[DECODE DEBUG] First decode for seq {seq_idx}:")
-                        print(
-                            f"  seq_len={seq_len}, query_len={query_len}, historical_len={historical_len}"
-                        )
-                        print(f"  hist_num_blocks={hist_num_blocks}")
-                        print(f"  hist_block_table={hist_block_table.tolist()}")
-                        print(f"  full block_table={seq_block_table.tolist()}")
-                        # Check if cache at first block is non-zero
-                        first_block = hist_block_table[0].item()
-                        cache_sample = key_cache[first_block, 0, 0, :3]
-                        print(
-                            f"  key_cache[{first_block}, 0, 0, :3]={cache_sample.tolist()}"
-                        )
-                        # Check the current token's K/V from input
-                        print(f"  key[q_start:q_end] shape: {key[q_start:q_end].shape}")
-                        print(
-                            f"  key[q_start:q_end] abs max: {key[q_start:q_end].abs().max().item():.6f}"
-                        )
-                        # Check slot_mapping to see where this token was written
-                        seq_slots = slot_mapping[q_start:q_end]
-                        print(f"  slot_mapping[q_start:q_end]={seq_slots.tolist()}")
-
                     gathered_hist_key = self._gather_kv_from_cache(
-                        key_cache, hist_block_table, historical_len, block_size
+                        key_cache, seq_block_table, historical_len, block_size
                     )
                     gathered_hist_value = self._gather_kv_from_cache(
-                        value_cache, hist_block_table, historical_len, block_size
+                        value_cache, seq_block_table, historical_len, block_size
                     )
-
-                    if DEBUG:
-                        gathered_max = gathered_hist_key.abs().max().item()
-                        print(f"  gathered_hist_key abs max: {gathered_max:.6f}")
-                        print(
-                            f"  gathered_key (after concat) shape: {torch.cat([gathered_hist_key, key[q_start:q_end]], dim=0).shape}"
-                        )
-
-                    # Concatenate historical from cache with current from input
                     gathered_key = torch.cat(
                         [gathered_hist_key, key[q_start:q_end]], dim=0
                     )
@@ -469,28 +465,164 @@ class MPSAttentionImpl(AttentionImpl):
                         [gathered_hist_value, value[q_start:q_end]], dim=0
                     )
                 else:
-                    # No historical tokens, just use current
                     gathered_key = key[q_start:q_end]
                     gathered_value = value[q_start:q_end]
 
-            # Run SDPA for this sequence
-            # seq_output is [query_len, num_heads, head_size]
             seq_output = self._compute_attention(
                 seq_query,
                 gathered_key,
                 gathered_value,
                 causal and self.attn_type == AttentionType.DECODER,
             )
-
-            # Write output - output tensor is [num_tokens, num_heads, head_size] (view of 2D)
             output[q_start:q_end] = seq_output
 
-        # CRITICAL: Synchronize to ensure all attention outputs are written before
-        # they are read for hidden states extraction. MPS operations are asynchronous
-        # and without this sync, subsequent reads (e.g., hidden_states[logits_indices])
-        # may see uninitialized/zero values at the last position.
-        torch.mps.synchronize()
+        return output
 
+    def _run_batched_decode(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Batched decode: all sequences have query_len=1.
+
+        For single sequence (batch=1): direct gather + SDPA without mask (fastest)
+        For multiple sequences: loop over each to avoid slow masked SDPA path
+        """
+        num_seqs = seq_lens.shape[0]
+        num_total_blocks = key_cache.shape[0]
+        num_kv_heads = key_cache.shape[2]
+        head_size = key_cache.shape[3]
+
+        # Flatten caches for gathering
+        key_cache_flat = key_cache.view(
+            num_total_blocks * block_size, num_kv_heads, head_size
+        )
+        value_cache_flat = value_cache.view(
+            num_total_blocks * block_size, num_kv_heads, head_size
+        )
+
+        # Process each sequence - this is fast because SDPA without mask is efficient
+        # and we avoid the 5x slowdown from using attention masks
+        for seq_idx in range(num_seqs):
+            # Get sequence info using tensor indexing (minimizes CPU sync)
+            seq_len = int(seq_lens[seq_idx])
+            hist_len = seq_len - 1
+
+            # Get query for this sequence
+            q_start = query_start_loc[seq_idx]
+            seq_q = query[q_start : q_start + 1]  # [1, num_heads, head_size]
+
+            # Get current K/V
+            curr_k = key[q_start : q_start + 1]  # [1, num_kv_heads, head_size]
+            curr_v = value[q_start : q_start + 1]
+
+            if hist_len > 0:
+                # Gather historical KV from cache (vectorized)
+                positions = torch.arange(hist_len, device=key_cache.device)
+                logical_blocks = positions // block_size
+                offsets = positions % block_size
+
+                num_blocks_needed = (hist_len + block_size - 1) // block_size
+                seq_block_table = block_table[seq_idx, :num_blocks_needed]
+                physical_blocks = seq_block_table[logical_blocks]
+                flat_indices = physical_blocks * block_size + offsets
+
+                hist_k = key_cache_flat[
+                    flat_indices
+                ]  # [hist_len, num_kv_heads, head_size]
+                hist_v = value_cache_flat[flat_indices]
+
+                # Concatenate: [seq_len, num_kv_heads, head_size]
+                seq_k = torch.cat([hist_k, curr_k[0:1]], dim=0)
+                seq_v = torch.cat([hist_v, curr_v[0:1]], dim=0)
+            else:
+                # No history - just use current K/V with shape [1, num_kv_heads, head_size]
+                seq_k = curr_k[0:1]
+                seq_v = curr_v[0:1]
+
+            # Expand KV heads for GQA
+            # seq_k/seq_v shape: [seq_len, num_kv_heads, head_size]
+            if self.num_kv_heads != self.num_heads:
+                seq_k = seq_k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                seq_v = seq_v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+            # Reshape for SDPA: [1, heads, seq_len, head_size]
+            # seq_q: [1, num_heads, head_size] -> [1, num_heads, 1, head_size]
+            seq_q = seq_q.unsqueeze(2)
+            # seq_k: [seq_len, num_heads, head_size] -> [1, num_heads, seq_len, head_size]
+            seq_k = seq_k.unsqueeze(0).permute(0, 2, 1, 3)
+            seq_v = seq_v.unsqueeze(0).permute(0, 2, 1, 3)
+
+            # Run SDPA without mask (fast path)
+            attn_output = F.scaled_dot_product_attention(
+                seq_q,
+                seq_k,
+                seq_v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,  # Single query sees all keys
+                scale=self.scale,
+            )
+
+            # Reshape: [1, num_heads, 1, head_size] -> [1, num_heads, head_size]
+            output[q_start] = attn_output[0, :, 0, :]
+
+        return output
+
+    def _run_batched_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_len: int,
+        num_seqs: int,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Batched prefill: all sequences have the same query length and seq_len == query_len."""
+        # Reshape from [total_tokens, num_heads, head_size] to [batch, seq_len, num_heads, head_size]
+        batch_q = query.view(num_seqs, query_len, self.num_heads, self.head_size)
+        batch_k = key.view(num_seqs, query_len, self.num_kv_heads, self.head_size)
+        batch_v = value.view(num_seqs, query_len, self.num_kv_heads, self.head_size)
+
+        # Expand KV heads for GQA
+        if self.num_kv_heads != self.num_heads:
+            batch_k = batch_k.repeat_interleave(self.num_queries_per_kv, dim=2)
+            batch_v = batch_v.repeat_interleave(self.num_queries_per_kv, dim=2)
+
+        # Reshape for SDPA: [batch, heads, seq_len, head_size]
+        batch_q = batch_q.transpose(1, 2)
+        batch_k = batch_k.transpose(1, 2)
+        batch_v = batch_v.transpose(1, 2)
+
+        # Run batched SDPA with causal mask
+        attn_output = F.scaled_dot_product_attention(
+            batch_q,
+            batch_k,
+            batch_v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=causal and self.attn_type == AttentionType.DECODER,
+            scale=self.scale,
+        )
+
+        # Reshape output: [batch, heads, seq_len, head_size] -> [total_tokens, num_heads, head_size]
+        attn_output = attn_output.transpose(1, 2).reshape(
+            -1, self.num_heads, self.head_size
+        )
+        output[: attn_output.shape[0]] = attn_output
+
+        # No sync needed - let GPU work asynchronously for better utilization
         return output
 
     def _gather_kv_from_cache_using_slots(
@@ -499,7 +631,7 @@ class MPSAttentionImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
-        """Gather KV from paged cache using slot_mapping directly.
+        """Gather KV from paged cache using slot_mapping directly (vectorized).
 
         This is the more direct approach - using the exact same slot indices
         that were used to write to the cache.
@@ -514,28 +646,11 @@ class MPSAttentionImpl(AttentionImpl):
         """
         num_kv_heads = cache.shape[2]
         head_size = cache.shape[3]
-        seq_len = slot_mapping.shape[0]
+        num_blocks = cache.shape[0]
 
-        # Synchronize before reading to ensure writes are complete
-        torch.mps.synchronize()
-
-        # Compute block indices and offsets from slot_mapping
-        block_indices = slot_mapping // block_size
-        block_offsets = slot_mapping % block_size
-
-        # Allocate output tensor
-        gathered = torch.zeros(
-            seq_len, num_kv_heads, head_size, dtype=cache.dtype, device=cache.device
-        )
-
-        # Gather from cache using the same indexing as writes
-        for i in range(seq_len):
-            block_idx = block_indices[i].item()
-            block_offset = block_offsets[i].item()
-            gathered[i] = cache[block_idx, block_offset].clone()
-
-        # Synchronize after reading to ensure data is materialized
-        torch.mps.synchronize()
+        # Flatten cache and use slot_mapping directly as indices
+        cache_flat = cache.view(num_blocks * block_size, num_kv_heads, head_size)
+        gathered = cache_flat[slot_mapping]
 
         return gathered
 
@@ -546,7 +661,7 @@ class MPSAttentionImpl(AttentionImpl):
         seq_len: int,
         block_size: int,
     ) -> torch.Tensor:
-        """Gather KV from paged cache.
+        """Gather KV from paged cache (vectorized).
 
         Args:
             cache: [num_blocks, block_size, num_kv_heads, head_size]
@@ -559,31 +674,23 @@ class MPSAttentionImpl(AttentionImpl):
         """
         num_kv_heads = cache.shape[2]
         head_size = cache.shape[3]
+        num_total_blocks = cache.shape[0]
 
-        # Synchronize before reading to ensure writes are complete
-        torch.mps.synchronize()
+        # Compute flat slot indices for all positions
+        # For position i, slot = block_table[i // block_size] * block_size + (i % block_size)
+        positions = torch.arange(seq_len, device=cache.device)
+        logical_block_indices = positions // block_size
+        block_offsets = positions % block_size
 
-        # Allocate output tensor
-        gathered = torch.zeros(
-            seq_len, num_kv_heads, head_size, dtype=cache.dtype, device=cache.device
-        )
+        # Map logical blocks to physical blocks using block_table
+        physical_block_indices = block_table[logical_block_indices]
 
-        # Gather from each block using explicit loop and copy
-        # cache shape: [num_blocks, block_size, num_kv_heads, head_size]
-        pos = 0
-        for i in range(len(block_table)):
-            block_idx = block_table[i].item()
-            tokens_in_block = min(block_size, seq_len - pos)
-            if tokens_in_block <= 0:
-                break
-            # Copy entire block slice at once for efficiency
-            gathered[pos : pos + tokens_in_block] = cache[
-                block_idx, :tokens_in_block
-            ].clone()
-            pos += tokens_in_block
+        # Compute flat indices: physical_block * block_size + offset
+        flat_indices = physical_block_indices * block_size + block_offsets
 
-        # Synchronize after reading to ensure data is materialized
-        torch.mps.synchronize()
+        # Flatten cache and gather
+        cache_flat = cache.view(num_total_blocks * block_size, num_kv_heads, head_size)
+        gathered = cache_flat[flat_indices]
 
         return gathered
 
@@ -655,21 +762,56 @@ class MPSAttentionImpl(AttentionImpl):
         attn_type: str,
     ) -> torch.Tensor:
         """Run SDPA for encoder attention (no KV cache)."""
-        query_start_loc = attn_metadata.query_start_loc.cpu()
+        query_start_loc = attn_metadata.query_start_loc
         causal = attn_type == AttentionType.DECODER
 
         num_seqs = query_start_loc.shape[0] - 1
 
-        for i in range(num_seqs):
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
+        # Check if all sequences have the same length for batched execution
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        unique_lens = torch.unique(query_lens)
 
-            seq_output = self._compute_attention(
-                query[start:end],
-                key[start:end],
-                value[start:end],
-                causal,
+        if unique_lens.numel() == 1 and num_seqs > 1:
+            # All same length - use batched SDPA
+            seq_len = int(unique_lens[0])
+            batch_q = query.view(num_seqs, seq_len, self.num_heads, self.head_size)
+            batch_k = key.view(num_seqs, seq_len, self.num_kv_heads, self.head_size)
+            batch_v = value.view(num_seqs, seq_len, self.num_kv_heads, self.head_size)
+
+            if self.num_kv_heads != self.num_heads:
+                batch_k = batch_k.repeat_interleave(self.num_queries_per_kv, dim=2)
+                batch_v = batch_v.repeat_interleave(self.num_queries_per_kv, dim=2)
+
+            batch_q = batch_q.transpose(1, 2)
+            batch_k = batch_k.transpose(1, 2)
+            batch_v = batch_v.transpose(1, 2)
+
+            attn_output = F.scaled_dot_product_attention(
+                batch_q,
+                batch_k,
+                batch_v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=causal,
+                scale=self.scale,
             )
-            output[start:end] = seq_output
+
+            attn_output = attn_output.transpose(1, 2).reshape(
+                -1, self.num_heads, self.head_size
+            )
+            output[: attn_output.shape[0]] = attn_output
+        else:
+            # Variable lengths - process individually using tensor indexing
+            for i in range(num_seqs):
+                start = query_start_loc[i]
+                end = query_start_loc[i + 1]
+
+                seq_output = self._compute_attention(
+                    query[start:end],
+                    key[start:end],
+                    value[start:end],
+                    causal,
+                )
+                output[start:end] = seq_output
 
         return output

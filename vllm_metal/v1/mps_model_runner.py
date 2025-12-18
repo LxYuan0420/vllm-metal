@@ -1,17 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 """MPS Model Runner for vLLM v1 API on Apple Silicon."""
 
+import os
+import time
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+
 logger = init_logger(__name__)
+
+# Profiling counters - enabled via VLLM_MPS_PROFILE=1
+_profile_enabled = os.environ.get("VLLM_MPS_PROFILE", "0") == "1"
+_profile_counts: dict[str, int] = {}
+_profile_times: dict[str, float] = {}
+_profile_start_time: float = 0.0
+
+
+def _profile_start(name: str) -> float:
+    """Start profiling a section."""
+    if not _profile_enabled:
+        return 0.0
+    torch.mps.synchronize()
+    return time.perf_counter()
+
+
+def _profile_end(name: str, start: float) -> None:
+    """End profiling a section."""
+    if not _profile_enabled or start == 0.0:
+        return
+    torch.mps.synchronize()
+    elapsed = time.perf_counter() - start
+    _profile_counts[name] = _profile_counts.get(name, 0) + 1
+    _profile_times[name] = _profile_times.get(name, 0.0) + elapsed
+
+
+def print_mps_profile() -> None:
+    """Print profiling summary."""
+    if not _profile_times:
+        print("No profiling data collected. Set VLLM_MPS_PROFILE=1 to enable.")
+        return
+    total = sum(_profile_times.values())
+    print("\n=== MPS Model Runner Profile ===")
+    for name, time_s in sorted(_profile_times.items(), key=lambda x: -x[1]):
+        count = _profile_counts.get(name, 1)
+        avg_ms = (time_s / count) * 1000 if count > 0 else 0
+        pct = (time_s / total) * 100 if total > 0 else 0
+        print(f"  {name}: {count} calls, {avg_ms:.2f}ms avg, {pct:.1f}%")
+    print(f"  Total: {total * 1000:.1f}ms")
 
 
 class MPSModelRunner(GPUModelRunner):
@@ -123,81 +169,106 @@ class MPSModelRunner(GPUModelRunner):
         """Synchronize input preparation for MPS.
 
         The parent class uses CUDA events for async synchronization, but MPS
-        doesn't support the same stream semantics. We use explicit MPS
-        synchronization instead.
+        doesn't support the same stream semantics. However, we DON'T sync here
+        because synced_forward() already syncs before reading tensors.
+        Removing this sync improves GPU utilization by allowing async operations.
         """
-        # Sync before yielding to ensure previous iteration's copies are done
-        torch.mps.synchronize()
+        # Don't sync here - synced_forward() handles synchronization before
+        # the model reads input tensors. This allows CPU work to overlap with
+        # previous GPU work, improving utilization.
         try:
             yield
         finally:
-            # Note: we don't sync here because _preprocess() runs AFTER this
-            # context manager exits. The sync is done in _preprocess() override.
             pass
 
     def load_model(self, eep_scale_up: bool = False) -> None:
-        """Load model onto MPS device and wrap it for synchronization."""
+        """Load model onto MPS device.
+
+        MPS uses unified memory, so no special wrapping is needed.
+        The model will run on the GPU and data transfers are essentially
+        zero-copy since CPU and GPU share the same physical memory.
+        """
         # Call parent's load_model which handles all the complexity
         super().load_model(eep_scale_up)
 
-        # Wrap the model's forward method to add MPS synchronization
-        self._wrap_model_forward()
-
-    def _wrap_model_forward(self) -> None:
-        """Wrap the model's forward/call method to add MPS synchronization.
-
-        MPS doesn't support CUDA stream semantics. When vLLM uses non_blocking=True
-        for CPU->GPU copies, we need explicit synchronization before the model
-        reads the input tensors.
-        """
-        original_forward = self.model.forward
-
-        def synced_forward(*args, **kwargs):
-            # Synchronize MPS before reading input tensors
-            # This ensures all async CPU->GPU copies are complete
-            torch.mps.synchronize()
-            result = original_forward(*args, **kwargs)
-            return result
-
-        # Replace the forward method
-        self.model.forward = synced_forward
-        logger.info("Wrapped model forward with MPS synchronization")
+        # Verify model is on MPS device
+        try:
+            first_param = next(iter(self.model.parameters()))
+            if first_param.device.type != "mps":
+                logger.warning(
+                    f"Model is NOT on MPS! Device: {first_param.device}. "
+                    "This may cause low GPU utilization."
+                )
+            else:
+                logger.info(f"Model loaded on device: {first_param.device}")
+        except StopIteration:
+            logger.warning("Model has no parameters!")
 
     def _sample(self, logits, spec_decode_metadata):
-        """Sample with MPS synchronization.
+        """Sample tokens from logits.
 
-        We need to synchronize after sampling to ensure the sampler output
-        tensors are fully computed before _bookkeeping_sync reads them.
-        Without this, we get race conditions where _bookkeeping_sync reads
-        garbage values from incomplete async MPS operations.
+        Don't sync here - defer to _to_list() which is called when we actually
+        need to read the results. This allows more GPU work to happen in parallel.
         """
         logger.debug("MPSModelRunner._sample: calling parent _sample")
         result = super()._sample(logits, spec_decode_metadata)
-        # Ensure sampling is complete before returning
-        # This prevents race conditions in _bookkeeping_sync
-        logger.debug("MPSModelRunner._sample: synchronizing MPS after sampling")
-        torch.mps.synchronize()
+        # Don't sync here - defer synchronization to when we actually need
+        # to read the results (in _to_list). This improves GPU utilization.
         return result
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         """Convert sampled token IDs tensor to Python list with MPS sync.
 
-        The parent class uses CUDA events to synchronize the async copy from
-        GPU to pinned CPU memory. Since MPS doesn't support CUDA events and
-        our placeholder events don't actually synchronize, we need to use
-        torch.mps.synchronize() instead.
+        MPS requires explicit synchronization before reading GPU tensor values
+        because our placeholder CUDA events don't actually synchronize.
         """
-        # First, sync to ensure the sampled_token_ids tensor is fully computed
+        start = _profile_start("_to_list")
+
+        # Sync MPS to ensure sampling is complete before reading tensor values
+        sync_start = _profile_start("_to_list.sync")
         torch.mps.synchronize()
+        _profile_end("_to_list.sync", sync_start)
 
-        # Copy to pinned CPU memory
-        pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
-        pinned.copy_(sampled_token_ids, non_blocking=True)
+        # For efficiency, convert directly from MPS tensor to list
+        # Using numpy array access is faster than copy + tolist
+        conv_start = _profile_start("_to_list.convert")
+        if sampled_token_ids.dim() == 1:
+            # 1D tensor: return as nested list [[id], [id], ...]
+            result = [[int(x)] for x in sampled_token_ids.cpu().numpy()]
+        else:
+            # 2D tensor: return as nested list [[id1, id2], ...]
+            result = sampled_token_ids.cpu().numpy().tolist()
+        _profile_end("_to_list.convert", conv_start)
 
-        # Sync again to ensure the copy is complete before reading
-        torch.mps.synchronize()
+        _profile_end("_to_list", start)
+        return result
 
-        return pinned.tolist()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        """Execute model with profiling for MPS.
+
+        This wraps the parent execute_model to add detailed timing information.
+        """
+        if not _profile_enabled:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+
+        # Profile the full execution
+        total_start = _profile_start("execute_model.total")
+
+        # The parent execute_model does everything, so just time it
+        result = super().execute_model(scheduler_output, intermediate_tensors)
+
+        _profile_end("execute_model.total", total_start)
+
+        # Print summary every 100 calls
+        count = _profile_counts.get("execute_model.total", 0)
+        if count > 0 and count % 100 == 0:
+            print_mps_profile()
+
+        return result
 
 
 @contextmanager

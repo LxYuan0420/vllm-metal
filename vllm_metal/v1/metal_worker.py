@@ -38,6 +38,10 @@ class MetalWorker(Worker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        logger.info(
+            "MetalWorker.__init__ called! worker_cls=%s",
+            vllm_config.parallel_config.worker_cls,
+        )
         super().__init__(
             vllm_config,
             local_rank,
