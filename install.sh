@@ -116,7 +116,12 @@ main() {
     exit 1
   fi
 
-  ensure_venv "$HOME/.venv-vllm-metal"
+  local venv="$HOME/.venv-vllm-metal"
+  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
+    venv="$PWD/.venv-vllm-metal"
+  fi
+
+  ensure_venv "$venv"
 
   local vllm_v="0.13.0"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
@@ -148,10 +153,10 @@ main() {
   success "Installation complete!"
   echo ""
   echo "To use vllm, activate the virtual environment:"
-  echo "  source .venv/bin/activate"
+  echo "  source $venv"
   echo ""
   echo "Or add the venv to your PATH:"
-  echo "  export PATH=\"\$PWD/.venv/bin:\$PATH\""
+  echo "  export PATH=\"$venv:\$PATH\""
 }
 
 main "$@"

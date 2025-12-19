@@ -39,7 +39,7 @@ ensure_uv() {
 ensure_venv() {
   if [ ! -d ".venv" ]; then
     section "Creating virtual environment"
-    uv venv "$1" --python 3.12
+    uv venv "$1" --clear --python 3.12
   fi
 
   # shellcheck source=/dev/null
