@@ -87,9 +87,9 @@ main() {
   # Source shared library functions
   # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
   local local_lib=""
-  if [[ -n "${BASH_SOURCE[0]}" ]]; then
+  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
     local_lib="$script_dir/scripts/lib.sh"
   fi
 
