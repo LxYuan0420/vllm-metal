@@ -99,16 +99,12 @@ class MetalPlatform(Platform):
         if py_platform.system() != "Darwin":
             return False
 
-        # Check MLX availability
+        # Check MLX availability without mutating global device state
         try:
             import mlx.core as mx
 
-            # Try to use the GPU
-            config = get_config()
-            if config.use_mlx:
-                mx.set_default_device(mx.Device(mx.DeviceType.gpu))
-            return True
-        except (ImportError, RuntimeError):
+            return bool(mx.metal.is_available())
+        except (ImportError, AttributeError, RuntimeError):
             return False
 
     @classmethod

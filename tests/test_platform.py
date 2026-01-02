@@ -58,6 +58,16 @@ class TestMetalPlatform:
         """Test platform availability on Apple Silicon."""
         assert MetalPlatform.is_available() is True
 
+    def test_is_available_does_not_mutate_default_device(self) -> None:
+        """Availability check should not change the MLX default device."""
+        mx = pytest.importorskip("mlx.core")
+
+        before = mx.default_device()
+        MetalPlatform.is_available()
+        after = mx.default_device()
+
+        assert before == after
+
     def test_torch_device(self) -> None:
         """Test PyTorch device retrieval."""
 
