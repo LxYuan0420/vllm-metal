@@ -5,7 +5,29 @@ This plugin enables vLLM to run on Apple Silicon Macs using MLX as the
 primary compute backend, with PyTorch for model loading and interoperability.
 """
 
+import os
+import sys
+
 __version__ = "0.1.0"
+
+
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _apply_macos_defaults() -> None:
+    """Apply safe defaults for macOS when using the Metal plugin.
+
+    vLLM's v1 engine launches a worker process. When the start method is `fork`,
+    macOS can crash the child process if the parent has imported libraries that
+    touched the Objective-C runtime (commonly surfaced as
+    `objc_initializeAfterForkError`).
+
+    Defaulting to `spawn` avoids forking a partially-initialized runtime.
+    """
+    if not _is_macos():
+        return
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 # Lazy imports to avoid loading vLLM dependencies when just importing the Rust extension
@@ -62,6 +84,8 @@ def _register() -> str | None:
     Returns:
         Fully qualified class name if platform is available, None otherwise
     """
+    _apply_macos_defaults()
+
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():
