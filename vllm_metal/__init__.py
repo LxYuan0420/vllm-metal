@@ -14,10 +14,6 @@ __version__ = "0.1.0"
 logger = logging.getLogger(__name__)
 
 
-def _is_macos() -> bool:
-    return sys.platform == "darwin"
-
-
 def _apply_macos_defaults() -> None:
     """Apply safe defaults for macOS when using the Metal plugin.
 
@@ -28,7 +24,7 @@ def _apply_macos_defaults() -> None:
 
     Defaulting to `spawn` avoids forking a partially-initialized runtime.
     """
-    if not _is_macos():
+    if sys.platform != "darwin":
         return
     if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is not None:
         return
