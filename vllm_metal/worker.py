@@ -184,8 +184,9 @@ class MetalWorker:
                 (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
             )
 
-            # Calculate effective memory fraction
-            effective_fraction = minimal_needed / total_memory
+            # Calculate how much of total unified memory the minimum requirement
+            # consumes (useful for user diagnostics in logs/errors).
+            needed_fraction = minimal_needed / total_memory
 
             if minimal_needed > total_memory:
                 msg = (
@@ -198,7 +199,7 @@ class MetalWorker:
                     f"(max_model_len={max_model_len}, "
                     f"block_size={self.config.block_size}, "
                     f"min_blocks={min_blocks}, "
-                    f"needed_fraction={effective_fraction:.3f}). "
+                    f"needed_fraction={needed_fraction:.3f}). "
                     "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
                     "or use a smaller model."
                 )
@@ -207,9 +208,9 @@ class MetalWorker:
             logger.info(
                 f"Auto memory mode: model={model_memory / 1e9:.2f}GB, "
                 f"max_model_len={max_model_len}, min_blocks={min_blocks}, "
-                f"min_cache={min_cache_memory / 1e9:.2f}GB, "
+                f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
                 f"total_needed={minimal_needed / 1e9:.2f}GB, "
-                f"effective_fraction={effective_fraction:.3f}"
+                f"needed_fraction={needed_fraction:.3f}"
             )
 
             available_memory = minimal_needed

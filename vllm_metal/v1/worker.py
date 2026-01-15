@@ -205,10 +205,7 @@ class MetalWorker(WorkerBase):
 
         block_size_bytes = self.get_cache_block_size_bytes()
         if block_size_bytes <= 0:
-            msg = (
-                "Computed KV cache block size is invalid "
-                f"({block_size_bytes} bytes)."
-            )
+            msg = f"Computed KV cache block size is invalid ({block_size_bytes} bytes)."
             raise ValueError(msg)
 
         block_size_tokens = self.metal_config.block_size
@@ -234,7 +231,9 @@ class MetalWorker(WorkerBase):
             overhead_factor=overhead_factor,
         )
 
-    def _format_auto_memory_infeasible_error(self, estimate: _AutoMemoryEstimate) -> str:
+    def _format_auto_memory_infeasible_error(
+        self, estimate: _AutoMemoryEstimate
+    ) -> str:
         return (
             "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
             "memory than is available. "
@@ -267,9 +266,9 @@ class MetalWorker(WorkerBase):
             logger.info(
                 f"Auto memory mode: model={estimate.model_memory / 1e9:.2f}GB, "
                 f"max_model_len={estimate.max_model_len}, min_blocks={estimate.min_blocks}, "
-                f"min_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
+                f"min_kv_cache={estimate.kv_cache_memory / 1e9:.2f}GB, "
                 f"total_needed={estimate.total_needed / 1e9:.2f}GB, "
-                f"effective_fraction={estimate.needed_fraction:.3f}"
+                f"needed_fraction={estimate.needed_fraction:.3f}"
             )
 
             # Return just the cache portion for KV cache allocation
