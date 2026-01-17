@@ -111,7 +111,10 @@ main() {
     rm -f "$lib_tmp"
   fi
 
-  require_apple_silicon
+  if ! is_apple_silicon; then
+    error "This installer requires Apple Silicon macOS (Darwin arm64)."
+    exit 1
+  fi
   if ! ensure_uv; then
     exit 1
   fi

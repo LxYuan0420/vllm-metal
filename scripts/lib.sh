@@ -21,14 +21,6 @@ is_apple_silicon() {
   [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]
 }
 
-# Exit with a clear error message when running on unsupported platforms
-require_apple_silicon() {
-  if ! is_apple_silicon; then
-    error "This script requires Apple Silicon macOS (Darwin arm64)."
-    return 1
-  fi
-}
-
 # Compare dotted versions (return 0 if $1 >= $2)
 version_ge() {
   local IFS=.
