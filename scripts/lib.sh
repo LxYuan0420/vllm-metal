@@ -55,38 +55,35 @@ version_ge() {
 
 # Ensure uv is installed
 ensure_uv() {
-  local install_url="${VLLM_METAL_UV_INSTALL_URL:-https://astral.sh/uv/install.sh}"
-  local install_version="${VLLM_METAL_UV_VERSION:-}"
-  local min_version="${VLLM_METAL_UV_MIN_VERSION-0.9.0}"
+  local install_url="https://astral.sh/uv/install.sh"
+  local min_version="0.9.18"
 
   if ! command -v uv &> /dev/null; then
     echo "uv not found, installing..."
-    if [ -n "$install_version" ]; then
-      if ! UV_VERSION="$install_version" curl -LsSf "$install_url" | sh; then
-        error "Failed to install uv"
-        return 1
-      fi
-    else
-      if ! curl -LsSf "$install_url" | sh; then
-        error "Failed to install uv"
-        return 1
-      fi
+    if ! curl -LsSf "$install_url" | sh; then
+      error "Failed to install uv"
+      return 1
     fi
 
     # Add uv to PATH for this session
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
-  if [ -n "$min_version" ]; then
-    local uv_version
-    uv_version="$(uv --version 2>/dev/null | awk '{print $2}')"
-    if [ -z "$uv_version" ]; then
-      error "Unable to determine uv version"
+  local uv_version
+  uv_version="$(uv --version 2>/dev/null | awk '{print $2}')"
+  if [ -z "$uv_version" ]; then
+    error "Unable to determine uv version"
+    return 1
+  fi
+  if ! version_ge "$uv_version" "$min_version"; then
+    echo "uv $uv_version is older than required $min_version, upgrading..."
+    if ! curl -LsSf "$install_url" | sh; then
+      error "Failed to upgrade uv"
       return 1
     fi
-    if ! version_ge "$uv_version" "$min_version"; then
+    uv_version="$(uv --version 2>/dev/null | awk '{print $2}')"
+    if [ -z "$uv_version" ] || ! version_ge "$uv_version" "$min_version"; then
       error "uv $uv_version is older than required $min_version"
-      error "Set VLLM_METAL_UV_INSTALL_URL or VLLM_METAL_UV_VERSION to upgrade"
       return 1
     fi
   fi
