@@ -111,7 +111,7 @@ main() {
     rm -f "$lib_tmp"
   fi
 
-  is_apple_silicon
+  require_apple_silicon
   if ! ensure_uv; then
     exit 1
   fi
@@ -162,4 +162,3 @@ main() {
 }
 
 main "$@"
-
