@@ -68,16 +68,10 @@ ensure_uv() {
     return 1
   fi
   if ! version_ge "$uv_version" "$min_version"; then
-    echo "uv $uv_version is older than required $min_version, upgrading..."
-    if ! curl -LsSf "$install_url" | sh; then
-      error "Failed to upgrade uv"
-      return 1
-    fi
-    uv_version="$(uv --version 2>/dev/null | awk '{print $2}')"
-    if [ -z "$uv_version" ] || ! version_ge "$uv_version" "$min_version"; then
-      error "uv $uv_version is older than required $min_version"
-      return 1
-    fi
+    error "uv $uv_version is older than required $min_version"
+    error "Please upgrade uv (e.g., 'brew upgrade uv' or"
+    error "'curl -LsSf https://astral.sh/uv/install.sh | sh' and ensure ~/.local/bin is in PATH)."
+    return 1
   fi
 }
 
