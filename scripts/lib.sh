@@ -24,7 +24,10 @@ is_apple_silicon() {
 # Compare dotted versions (return 0 if $1 >= $2)
 version_ge() {
   local IFS=.
-  local -a v1=($1) v2=($2)
+  local -a v1=()
+  local -a v2=()
+  read -r -a v1 <<< "$1"
+  read -r -a v2 <<< "$2"
   local i
 
   for ((i=${#v1[@]}; i<${#v2[@]}; i++)); do
