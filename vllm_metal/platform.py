@@ -275,22 +275,6 @@ class MetalPlatform(Platform):
         if normalized in ("", "none", "null"):
             return
 
-        dtype_aliases = {
-            "fp16",
-            "float16",
-            "half",
-            "bf16",
-            "bfloat16",
-            "fp32",
-            "float32",
-        }
-        if normalized in dtype_aliases:
-            msg = (
-                f"Quantization '{quant}' is not supported on Metal/MLX. "
-                "If you intended precision control, use --dtype instead."
-            )
-            raise ValueError(msg)
-
         msg = (
             f"Quantization '{quant}' is not supported on Metal/MLX. "
             "Use an MLX-compatible quantized model (for example, a 4-bit MLX "

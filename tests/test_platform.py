@@ -122,12 +122,6 @@ class TestMetalPlatform:
         MetalPlatform.verify_quantization("")
         MetalPlatform.verify_quantization("  NONE  ")
 
-    def test_verify_quantization_rejects_dtype_aliases(self) -> None:
-        """Quantization should reject dtype-like aliases with guidance."""
-        for quant in ("fp16", "bfloat16", "float32"):
-            with pytest.raises(ValueError, match="--dtype"):
-                MetalPlatform.verify_quantization(quant)
-
     def test_verify_quantization_rejects_unsupported(self) -> None:
         """Quantization should reject unsupported methods."""
         for quant in (
