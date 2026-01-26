@@ -164,10 +164,10 @@ class MetalModelRunner:
         pad_id = 0
         padded_rows = [row + [pad_id] * (max_len - len(row)) for row in input_ids_list]
 
-        input_ids = mx.array(padded_rows, dtype=mx.int32)
+        input_ids_array = mx.array(padded_rows, dtype=mx.int32)
         positions = mx.array([list(range(max_len))] * len(padded_rows), dtype=mx.int32)
 
-        return input_ids, positions, seq_lens
+        return input_ids_array, positions, seq_lens
 
     def execute_model(
         self,
