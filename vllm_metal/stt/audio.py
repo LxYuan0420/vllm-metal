@@ -271,7 +271,7 @@ def log_mel_spectrogram(
 
     window = _hanning(N_FFT)
     freqs = _stft(audio, window, N_FFT, HOP_LENGTH)
-    magnitudes = mx.abs(freqs).square()
+    magnitudes = (freqs * mx.conj(freqs)).real
 
     filters = _mel_filters(SAMPLE_RATE, N_FFT, n_mels)
     mel_spec = filters @ magnitudes
