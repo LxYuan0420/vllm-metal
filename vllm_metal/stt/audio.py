@@ -311,13 +311,28 @@ def _rms_energy(audio: mx.array, window_size: int) -> mx.array:
         RMS energy of each window.
     """
     n = audio.shape[0]
-    # Pad to an exact multiple of window_size so we can reshape
+    if n == 0:
+        return mx.array([])
+
+    n_windows = math.ceil(n / window_size)
+    pad = n_windows * window_size - n
+    if pad > 0:
+        audio = mx.pad(audio, [(0, pad)])
+
+    windows = audio.reshape(n_windows, window_size)
+    sum_squares = mx.sum(windows * windows, axis=1)
+
+    if pad == 0:
+        return mx.sqrt(sum_squares / window_size)
+
     remainder = n % window_size
-    if remainder != 0:
-        audio = mx.pad(audio, [(0, window_size - remainder)])
-    # Reshape into (n_windows, window_size) and compute RMS per row
-    windows = audio.reshape(-1, window_size)
-    return mx.sqrt(mx.mean(windows * windows, axis=1))
+    if n_windows == 1:
+        counts = mx.array([float(remainder)], dtype=mx.float32)
+    else:
+        full_counts = mx.full((n_windows - 1,), float(window_size), dtype=mx.float32)
+        last_count = mx.array([float(remainder)], dtype=mx.float32)
+        counts = mx.concatenate([full_counts, last_count])
+    return mx.sqrt(sum_squares / counts)
 
 
 def _find_split_point(
