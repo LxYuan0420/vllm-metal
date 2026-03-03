@@ -8,6 +8,7 @@ and energy-based long-audio splitting.
 from __future__ import annotations
 
 import math
+import shutil
 import subprocess
 from functools import lru_cache
 
@@ -41,6 +42,9 @@ _LOG_SCALE = 4.0
 # room to find a natural pause without jumping too far from the ideal
 # chunk length.
 _SPLIT_SEARCH_MULTIPLIER = 4
+
+# Maximum time (seconds) to wait for ffmpeg decode before failing.
+_FFMPEG_TIMEOUT_S = 300
 
 
 # ===========================================================================
@@ -77,20 +81,27 @@ def load_audio(file_path: str, sample_rate: int = SAMPLE_RATE) -> mx.array:
     return _load_audio_ffmpeg(file_path, sample_rate)
 
 
-def _load_audio_ffmpeg(file_path: str, sample_rate: int) -> mx.array:
+def _load_audio_ffmpeg(
+    file_path: str,
+    sample_rate: int,
+    timeout_s: float = _FFMPEG_TIMEOUT_S,
+) -> mx.array:
     """Load audio via ffmpeg subprocess.
 
     Args:
         file_path: Path to the audio file.
         sample_rate: Target sample rate in Hz.
+        timeout_s: Timeout (seconds) for ffmpeg decode.
 
     Returns:
         1-D ``mx.array`` of float32 samples.
 
     Raises:
         RuntimeError: If ffmpeg is missing or returns an error.
+        ValueError: If ``timeout_s`` is not positive.
     """
-    import shutil
+    if timeout_s <= 0:
+        raise ValueError("ffmpeg timeout must be > 0")
 
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found. Install it with: brew install ffmpeg")
@@ -111,7 +122,10 @@ def _load_audio_ffmpeg(file_path: str, sample_rate: int) -> mx.array:
         "error",
         "pipe:1",
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg timed out after {timeout_s}s decoding {file_path}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg error: {result.stderr.decode()}")
     return mx.array(np.frombuffer(result.stdout, np.float32), mx.float32)
