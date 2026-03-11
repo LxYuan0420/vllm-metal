@@ -31,6 +31,7 @@ from vllm_metal.stt.config import (
     QWEN3_ASR_MAX_DECODE_TOKENS,
     WHISPER_MAX_DECODE_TOKENS,
     SpeechToTextConfig,
+    validate_language,
 )
 from vllm_metal.stt.protocol import TranscriptionSegment
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel
@@ -56,6 +57,9 @@ _MAX_PROMPT_TOKENS = 224
 
 # Regex to detect Whisper timestamp tokens like ``<|0.00|>``.
 _TIMESTAMP_RE = re.compile(r"<\|(\d+\.\d+)\|>")
+
+# Supported tasks for Whisper transcription requests.
+_WHISPER_TASKS = frozenset({"transcribe", "translate"})
 
 
 # ===========================================================================
@@ -135,6 +139,8 @@ class WhisperTranscriber:
         Returns:
             :class:`TranscriptionResult` with text and optional segments.
         """
+        language, task = self._resolve_decode_options(language, task)
+
         if isinstance(audio, str):
             audio = load_audio(audio, sample_rate=SAMPLE_RATE)
         elif isinstance(audio, np.ndarray):
@@ -251,6 +257,32 @@ class WhisperTranscriber:
         """Resolve a special token string to its integer ID."""
         return self.tokenizer.convert_tokens_to_ids(token)
 
+    def _resolve_decode_options(
+        self,
+        language: str | None,
+        task: str,
+    ) -> tuple[str | None, str]:
+        """Validate and normalize task/language options for Whisper."""
+        task = task.strip().lower()
+        if task not in _WHISPER_TASKS:
+            supported = ", ".join(sorted(_WHISPER_TASKS))
+            raise ValueError(
+                f"Unsupported STT task: {task!r}. Must be one of {supported}."
+            )
+
+        is_multilingual = getattr(self.model, "is_multilingual", True)
+        if is_multilingual:
+            return validate_language(language, default=None), task
+
+        resolved_language = validate_language(language, default=None)
+        if task == "translate":
+            raise ValueError("English-only Whisper models do not support translation.")
+        if resolved_language not in (None, "en"):
+            raise ValueError(
+                "English-only Whisper models only support English transcription."
+            )
+        return resolved_language, task
+
     def _encode_prompt(self, prompt: str | None) -> list[int]:
         """Encode a user prompt into ``<|startofprev|>`` prefix tokens.
 
@@ -296,6 +328,7 @@ class WhisperTranscriber:
         Returns:
             List of decoded token IDs (excluding special prefix).
         """
+        language, task = self._resolve_decode_options(language, task)
         if max_tokens is None:
             max_tokens = (
                 WHISPER_MAX_DECODE_TOKENS if with_timestamps else _MAX_PROMPT_TOKENS
@@ -303,7 +336,7 @@ class WhisperTranscriber:
 
         prefix = self._encode_prompt(prompt)
         prefix.append(self._get_token_id("<|startoftranscript|>"))
-        if self.model.is_multilingual:
+        if getattr(self.model, "is_multilingual", True):
             prefix.append(self._get_token_id(f"<|{language or 'en'}|>"))
             prefix.append(self._get_token_id(f"<|{task}|>"))
         if not with_timestamps:

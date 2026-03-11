@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -193,6 +194,48 @@ class TestLoadModel:
 
         with pytest.raises(FileNotFoundError, match="No weight files"):
             load_model(tmp_path)
+
+
+class TestResolveDecodeOptions:
+    """Tests for WhisperTranscriber task/language validation."""
+
+    def test_multilingual_model_normalizes_inputs(self) -> None:
+        transcriber = WhisperTranscriber(
+            model=SimpleNamespace(is_multilingual=True),
+            model_path=None,
+        )
+
+        language, task = transcriber._resolve_decode_options(" EN ", "Transcribe")
+
+        assert language == "en"
+        assert task == "transcribe"
+
+    def test_invalid_task_raises(self) -> None:
+        transcriber = WhisperTranscriber(
+            model=SimpleNamespace(is_multilingual=True),
+            model_path=None,
+        )
+
+        with pytest.raises(ValueError, match="Unsupported STT task"):
+            transcriber._resolve_decode_options("en", "summarize")
+
+    def test_english_only_model_rejects_translation(self) -> None:
+        transcriber = WhisperTranscriber(
+            model=SimpleNamespace(is_multilingual=False),
+            model_path=None,
+        )
+
+        with pytest.raises(ValueError, match="do not support translation"):
+            transcriber._resolve_decode_options(None, "translate")
+
+    def test_english_only_model_rejects_non_english_language(self) -> None:
+        transcriber = WhisperTranscriber(
+            model=SimpleNamespace(is_multilingual=False),
+            model_path=None,
+        )
+
+        with pytest.raises(ValueError, match="only support English transcription"):
+            transcriber._resolve_decode_options("fr", "transcribe")
 
 
 # ===========================================================================
