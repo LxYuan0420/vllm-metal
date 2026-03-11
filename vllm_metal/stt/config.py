@@ -74,6 +74,19 @@ class SpeechToTextConfig:
     # Deprecated: Whisper requires 16kHz; this field is ignored.
     sample_rate: int = 16000
 
+    def __post_init__(self) -> None:
+        """Validate runtime chunking parameters."""
+        if self.max_audio_clip_s <= 0:
+            raise ValueError("max_audio_clip_s must be > 0")
+        if self.overlap_chunk_second < 0:
+            raise ValueError("overlap_chunk_second must be >= 0")
+        if self.overlap_chunk_second >= self.max_audio_clip_s:
+            raise ValueError("overlap_chunk_second must be < max_audio_clip_s")
+        if self.min_energy_split_window_size <= 0:
+            raise ValueError("min_energy_split_window_size must be > 0")
+        if self.sample_rate <= 0:
+            raise ValueError("sample_rate must be > 0")
+
 
 def is_stt_model(model_path: str) -> bool:
     """Return ``True`` if *model_path* points to a Speech-to-Text model.

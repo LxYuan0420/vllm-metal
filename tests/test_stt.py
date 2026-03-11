@@ -47,6 +47,27 @@ class TestSpeechToTextConfig:
         assert cfg.overlap_chunk_second == 0.5
         assert cfg.min_energy_split_window_size == 800
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"max_audio_clip_s": 0.0}, "max_audio_clip_s"),
+            ({"overlap_chunk_second": -0.1}, "overlap_chunk_second"),
+            (
+                {"max_audio_clip_s": 10.0, "overlap_chunk_second": 10.0},
+                "overlap_chunk_second",
+            ),
+            ({"min_energy_split_window_size": 0}, "min_energy_split_window_size"),
+            ({"sample_rate": 0}, "sample_rate"),
+        ],
+    )
+    def test_invalid_values_raise(
+        self,
+        kwargs: dict[str, float | int],
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            SpeechToTextConfig(**kwargs)
+
 
 # ===========================================================================
 # validate_language
