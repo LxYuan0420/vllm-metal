@@ -61,6 +61,7 @@ from vllm_metal.stt.config import (
     STT_SCHED_BLOCK_BYTES,
     is_stt_model,
 )
+from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
@@ -614,43 +615,8 @@ class STTExecutor:
         """End-of-text token ID resolved from the tokenizer."""
         return self.transcriber.tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
-    def extract_audio_features(self, new_req: Any) -> "mx.array | None":
-        """Extract and encode audio features from a request.
-
-        Handles two formats:
-        - vLLM MultiModalFeatureSpec: ``mm_features[0].data['input_features'].data``
-        - Plain dict: ``mm_features[0]['input_features']``
-
-        Expects HF WhisperFeatureExtractor output with shape ``(n_mels, time)``
-        and transposes to ``(batch, time, n_mels)`` for the encoder.
-
-        Returns:
-            Encoded audio features, or None if input is missing/malformed.
-        """
-        mm_features = getattr(new_req, "mm_features", None)
-        if mm_features is None:
-            return None
-        if not isinstance(mm_features, list) or len(mm_features) == 0:
-            return None
-
-        first = mm_features[0]
-
-        # Extract input_features from the multimodal data.
-        # vLLM's MultiModalFeatureSpec.data is a MultiModalKwargsItem
-        # (UserDict subclass), not a plain dict.
-        input_features = None
-        if hasattr(first, "data") and hasattr(first.data, "get"):
-            # MultiModalFeatureSpec → .data is MultiModalKwargsItem (UserDict)
-            elem = first.data.get("input_features")
-            if elem is not None:
-                # MultiModalFieldElem has .data with the actual tensor
-                input_features = getattr(elem, "data", elem)
-        elif isinstance(first, dict):
-            input_features = first.get("input_features")
-
-        if input_features is None:
-            return None
-
+    def extract_audio_features(self, input_features: Any) -> "mx.array":
+        """Extract and encode STT input features."""
         # Convert to MLX array — handle numpy, torch, and lists
         if isinstance(input_features, np.ndarray):
             mel = mx.array(input_features, dtype=mx.float16)
@@ -2327,20 +2293,16 @@ class MetalModelRunner:
                     f"Got temperature={sampling_params.temperature}"
                 )
 
-            audio_features = self._stt_executor.extract_audio_features(new_req)
-            if audio_features is None:
-                # No audio — return EOT immediately
-                logger.warning("STT: no audio features for req %s", req_id)
-                req_ids.append(req_id)
-                req_id_to_index[req_id] = len(req_ids) - 1
-                sampled_tokens.append([eot_token])
-                continue
+            stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
+            audio_features = self._stt_executor.extract_audio_features(
+                stt_request.input_features
+            )
+            tokens = self._stt_executor.decode(
+                audio_features, list(stt_request.prompt_token_ids)
+            )
 
-            prompt_token_ids = list(new_req.prompt_token_ids or [])
-            tokens = self._stt_executor.decode(audio_features, prompt_token_ids)
-
-            req_ids.append(req_id)
-            req_id_to_index[req_id] = len(req_ids) - 1
+            req_ids.append(stt_request.req_id)
+            req_id_to_index[stt_request.req_id] = len(req_ids) - 1
             sampled_tokens.append(tokens)
 
         # Handle cached requests: STT processes everything in one shot,
