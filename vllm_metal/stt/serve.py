@@ -83,7 +83,9 @@ class VLLMSTTRequestAdapter:
                 f"STT request {req_id!r} has invalid prompt_token_ids."
             ) from exc
 
-        if not all(isinstance(tok, Integral) and not isinstance(tok, bool) for tok in tokens):
+        if not all(
+            isinstance(tok, Integral) and not isinstance(tok, bool) for tok in tokens
+        ):
             raise ValueError(f"STT request {req_id!r} has invalid prompt_token_ids.")
 
         return tuple(int(tok) for tok in tokens)

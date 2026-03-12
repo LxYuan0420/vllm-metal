@@ -156,8 +156,6 @@ class TestExtractAudioFeatures:
         executor.model.encode.assert_called_once()
 
 
-
-
 class TestExtractAudioFeatureValidation:
     """Validation of normalized STT input features."""
 
