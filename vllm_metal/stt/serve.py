@@ -3,12 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Integral
 from typing import Any
-
-import numpy as np
 
 
 @dataclass(frozen=True)
@@ -25,112 +21,40 @@ class VLLMSTTRequestAdapter:
 
     @classmethod
     def from_vllm_request(cls, request: Any) -> STTRequestInput:
-        """Normalize a vLLM request object for the STT runtime path."""
-        req_id = cls._get_request_id(request)
-        prompt_token_ids = cls._get_request_prompt_token_ids(request, req_id)
-        mm_features = cls._get_request_mm_features(request, req_id)
-        normalized_prompt_token_ids = cls._normalize_prompt_token_ids(
-            req_id, prompt_token_ids
-        )
+        """Normalize a vLLM request object for the STT runtime path.
 
+        Note: This adapter is used on the v1 runner path where vLLM already
+        provides a typed request shape (e.g. NewRequestData). We trust vLLM's
+        field-level contracts (req_id/prompt_token_ids/mm_features) and only
+        validate STT-specific invariants (e.g. presence of input_features).
+        """
+        req_id = request.req_id
         return STTRequestInput(
             req_id=req_id,
-            prompt_token_ids=normalized_prompt_token_ids,
-            input_features=cls._extract_input_features(req_id, mm_features),
+            prompt_token_ids=tuple(request.prompt_token_ids or ()),
+            input_features=cls._extract_input_features(req_id, request.mm_features),
         )
 
     @staticmethod
-    def _get_request_id(request: Any) -> str:
-        """Return the request id from a vLLM STT request object."""
-        try:
-            return str(request.req_id)
-        except AttributeError as exc:
-            raise ValueError("STT request is missing req_id.") from exc
+    def _extract_input_features(req_id: str, mm_features: Any) -> Any:
+        """Extract STT input features from vLLM multimodal feature wrappers.
 
-    @staticmethod
-    def _get_request_prompt_token_ids(request: Any, req_id: str) -> Any:
-        """Return prompt token ids from a vLLM STT request object."""
-        try:
-            return request.prompt_token_ids
-        except AttributeError as exc:
-            raise ValueError(
-                f"STT request {req_id!r} is missing prompt_token_ids."
-            ) from exc
+        vLLM v1 provides multimodal inputs as a list of `MultiModalFeatureSpec`.
+        For STT, we currently assume one audio feature per request and unwrap:
 
-    @staticmethod
-    def _get_request_mm_features(request: Any, req_id: str) -> Any:
-        """Return multimodal features from a vLLM STT request object."""
-        try:
-            return request.mm_features
-        except AttributeError as exc:
-            raise ValueError(f"STT request {req_id!r} is missing mm_features.") from exc
+        - `mm_features[0].data["input_features"].data`
 
-    @staticmethod
-    def _normalize_prompt_token_ids(
-        req_id: str, prompt_token_ids: Any
-    ) -> tuple[int, ...]:
-        """Normalize request prompt token ids for the STT runtime path."""
-        if prompt_token_ids is None:
-            return ()
+        Each `.data` layer may be `None` (e.g. cached/absent), so we treat any
+        missing/None value as an invalid STT request and raise a request-scoped
+        `ValueError`.
+        """
+        if not mm_features:
+            raise ValueError(f"STT request {req_id!r} must include mm_features.")
 
-        if isinstance(prompt_token_ids, (str, bytes)):
-            raise ValueError(f"STT request {req_id!r} has invalid prompt_token_ids.")
-
-        try:
-            tokens = tuple(prompt_token_ids)
-        except TypeError as exc:
-            raise ValueError(
-                f"STT request {req_id!r} has invalid prompt_token_ids."
-            ) from exc
-
-        if not all(
-            isinstance(tok, Integral) and not isinstance(tok, bool) for tok in tokens
-        ):
-            raise ValueError(f"STT request {req_id!r} has invalid prompt_token_ids.")
-
-        return tuple(int(tok) for tok in tokens)
-
-    @classmethod
-    def _extract_input_features(cls, req_id: str, mm_features: Any) -> Any:
-        """Extract raw input features from a vLLM multimodal payload."""
-        if not isinstance(mm_features, list) or not mm_features:
-            raise ValueError(
-                f"STT request {req_id!r} must include non-empty mm_features."
-            )
-
-        payload = cls._resolve_feature_payload(req_id, mm_features[0])
-        input_features = payload.get("input_features")
-
+        payload = mm_features[0].data
+        field_elem = payload.get("input_features") if payload else None
+        input_features = field_elem.data if field_elem is not None else None
         if input_features is None:
             raise ValueError(f"STT request {req_id!r} must include input_features.")
 
-        if isinstance(input_features, np.ndarray):
-            return input_features
-
-        try:
-            unwrapped_input_features = input_features.data
-        except AttributeError:
-            return input_features
-
-        if unwrapped_input_features is None:
-            raise ValueError(f"STT request {req_id!r} must include input_features.")
-
-        return unwrapped_input_features
-
-    @staticmethod
-    def _resolve_feature_payload(req_id: str, feature: Any) -> Mapping[str, Any]:
-        """Return the mapping payload for one multimodal feature entry."""
-        if isinstance(feature, Mapping):
-            return feature
-
-        try:
-            payload = feature.data
-        except AttributeError as exc:
-            raise ValueError(
-                f"STT request {req_id!r} must include input_features."
-            ) from exc
-
-        if isinstance(payload, Mapping):
-            return payload
-
-        raise ValueError(f"STT request {req_id!r} must include input_features.")
+        return input_features

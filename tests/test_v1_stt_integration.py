@@ -64,8 +64,11 @@ def _make_executor() -> STTExecutor:
     return executor
 
 
-def _make_valid_mm_features() -> list[dict[str, np.ndarray]]:
-    return [{"input_features": np.zeros((80, 3000), dtype=np.float32)}]
+def _make_valid_mm_features() -> list[SimpleNamespace]:
+    mel = np.zeros((80, 3000), dtype=np.float32)
+    field_elem = SimpleNamespace(data=mel)
+    feature_spec = SimpleNamespace(data={"input_features": field_elem})
+    return [feature_spec]
 
 
 def _make_runner() -> _StubRunner:
@@ -92,9 +95,14 @@ def _make_new_req(
 ) -> SimpleNamespace:
     req = SimpleNamespace()
     req.req_id = req_id
-    req.prompt_token_ids = prompt_token_ids or [50258, 50259, 50359]
-    req.sampling_params = sampling_params or SamplingParams(temperature=0)
-    req.mm_features = mm_features
+    req.prompt_token_ids = (
+        [50258, 50259, 50359] if prompt_token_ids is None else prompt_token_ids
+    )
+    req.sampling_params = (
+        SamplingParams(temperature=0) if sampling_params is None else sampling_params
+    )
+    # vLLM normalizes missing multimodal payloads to an empty list.
+    req.mm_features = mm_features or []
     return req
 
 
@@ -239,16 +247,6 @@ class TestExecuteSTTProtocol:
         sched = _make_scheduler_output(new_reqs=[req])
 
         with pytest.raises(ValueError, match="broken-req"):
-            self._run_stt(runner, sched)
-
-    def test_missing_req_id_uses_adapter_error(self) -> None:
-        """Missing req_id should raise the adapter validation error."""
-        runner = _make_runner()
-        req = _make_new_req(mm_features=_make_valid_mm_features())
-        del req.req_id
-        sched = _make_scheduler_output(new_reqs=[req])
-
-        with pytest.raises(ValueError, match="missing req_id"):
             self._run_stt(runner, sched)
 
     def test_encode_valueerror_propagates(self) -> None:
