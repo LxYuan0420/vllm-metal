@@ -529,7 +529,6 @@ class TestBuildPromptTokens:
         )
         model = MagicMock()
         model.config = config
-        t = Qwen3ASRTranscriber(model, model_path=str(tmp_path))
 
         # Inject mock tokenizer with deterministic encode
         mock_tok = MagicMock()
@@ -543,7 +542,7 @@ class TestBuildPromptTokens:
         mock_tok.encode = MagicMock(
             side_effect=lambda s, add_special_tokens=False: _encode_map.get(s, [0])
         )
-        t._tokenizer = mock_tok
+        t = Qwen3ASRTranscriber(model, tokenizer=mock_tok)
         return t
 
     def test_audio_pad_count_matches_frames(self, transcriber) -> None:

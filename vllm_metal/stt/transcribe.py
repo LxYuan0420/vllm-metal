@@ -11,16 +11,14 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from vllm_metal.stt.config import (
-    QWEN3_ASR_MAX_DECODE_TOKENS,
-    SpeechToTextConfig,
-)
+from vllm_metal.stt.config import SpeechToTextConfig
 from vllm_metal.stt.protocol import TranscriptionResult
-from vllm_metal.stt.qwen3_asr import Qwen3ASRConfig, Qwen3ASRModel
+from vllm_metal.stt.qwen3_asr import (
+    Qwen3ASRConfig,
+    Qwen3ASRModel,
+    Qwen3ASRTranscriber,  # noqa: F401
+)
 from vllm_metal.stt.whisper import WhisperConfig, WhisperModel, WhisperTranscriber
-
-# Tag used by Qwen3-ASR to wrap transcription text
-_ASR_TEXT_TAG = "<asr_text>"
 
 logger = logging.getLogger(__name__)
 
@@ -29,143 +27,8 @@ try:
 except ImportError:  # pragma: no cover
     snapshot_download = None  # type: ignore[assignment]
 
-try:
-    from transformers import AutoTokenizer
-except ImportError:  # pragma: no cover
-    AutoTokenizer = None  # type: ignore[assignment]
-
 # Supported floating-point dtypes for STT model loading.
 _SUPPORTED_LOAD_DTYPES = frozenset({mx.float16, mx.float32, mx.bfloat16})
-
-
-# ===========================================================================
-# Qwen3-ASR Transcriber
-# ===========================================================================
-
-
-class Qwen3ASRTranscriber:
-    """Transcriber for Qwen3-ASR models.
-
-    Handles prompt construction with audio_pad tokens,
-    embedding injection, and greedy autoregressive decoding.
-
-    Args:
-        model: Loaded :class:`Qwen3ASRModel`.
-        model_path: Path to model directory (for tokenizer loading).
-    """
-
-    def __init__(self, model, model_path: str | None = None):
-        self.model = model
-        self.model_path = model_path
-        self._tokenizer = None
-
-    @property
-    def tokenizer(self):
-        """Lazily-loaded tokenizer (Qwen2Tokenizer via AutoTokenizer)."""
-        if self._tokenizer is None:
-            self._tokenizer = _load_qwen3_asr_tokenizer(self.model_path)
-        return self._tokenizer
-
-    def greedy_decode_tokens(
-        self,
-        audio_features: mx.array,
-        prompt_token_ids: list[int],
-        max_tokens: int | None = None,
-    ) -> list[int]:
-        """Greedy autoregressive decode with audio embedding injection.
-
-        Args:
-            audio_features: Audio embeddings from the encoder.
-            prompt_token_ids: Full prompt with audio_pad placeholders.
-            max_tokens: Maximum decode steps
-                (default: :data:`QWEN3_ASR_MAX_DECODE_TOKENS`).
-
-        Returns:
-            Decoded token IDs (excluding prompt prefix, excluding EOS).
-        """
-        if max_tokens is None:
-            max_tokens = QWEN3_ASR_MAX_DECODE_TOKENS
-
-        if not prompt_token_ids:
-            logger.warning("Empty prompt_token_ids; returning no tokens")
-            return []
-
-        eos_token = self.model.config.eos_token_id
-        tokens = mx.array([prompt_token_ids], dtype=mx.int32)
-
-        # Prefill with audio embedding injection
-        logits, cache = self.model.prefill(tokens, audio_features)
-        mx.eval(logits)
-
-        output_tokens: list[int] = []
-        next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-        if next_token == eos_token:
-            return output_tokens
-        output_tokens.append(next_token)
-
-        # Autoregressive decode
-        for _ in range(max_tokens - 1):
-            token_input = mx.array([[next_token]], dtype=mx.int32)
-            logits, cache = self.model.decode_step(token_input, cache)
-            mx.eval(logits)
-            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
-            if next_token == eos_token:
-                break
-            output_tokens.append(next_token)
-
-        return output_tokens
-
-    def build_prompt_tokens(self, n_audio_frames: int) -> list[int]:
-        """Build prompt token IDs with audio placeholders.
-
-        Format: ``<|im_start|>user\\n<|audio_start|>{N*audio_pad}<|audio_end|>\\n<|im_end|>\\n<|im_start|>assistant\\n``
-
-        Args:
-            n_audio_frames: Number of audio_pad tokens to insert.
-
-        Returns:
-            List of token IDs.
-        """
-        tok = self.tokenizer
-        audio_pad_id = self.model.config.audio_token_id
-        audio_start_id = self.model.config.audio_start_token_id
-        audio_end_id = self.model.config.audio_end_token_id
-
-        # Encode structural tokens
-        im_start = tok.encode("<|im_start|>", add_special_tokens=False)
-        im_end = tok.encode("<|im_end|>", add_special_tokens=False)
-        user = tok.encode("user\n", add_special_tokens=False)
-        assistant = tok.encode("assistant\n", add_special_tokens=False)
-        newline = tok.encode("\n", add_special_tokens=False)
-
-        prompt = (
-            im_start
-            + user
-            + [audio_start_id]
-            + [audio_pad_id] * n_audio_frames
-            + [audio_end_id]
-            + newline
-            + im_end
-            + newline
-            + im_start
-            + assistant
-        )
-        return prompt
-
-    @staticmethod
-    def post_process_output(text: str) -> str:
-        """Strip ``language {lang}<asr_text>`` prefix and trailing tags."""
-        if not text:
-            return ""
-        if _ASR_TEXT_TAG not in text:
-            return text
-        _, text_part = text.rsplit(_ASR_TEXT_TAG, 1)
-        # Truncate at first special token marker
-        for marker in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
-            idx = text_part.find(marker)
-            if idx >= 0:
-                text_part = text_part[:idx]
-        return text_part.strip()
 
 
 # ===========================================================================
@@ -298,35 +161,6 @@ def _load_qwen3_asr_model(model_path: Path, config_dict: dict, dtype: mx.Dtype):
     config = Qwen3ASRConfig.from_dict(config_dict)
     model = Qwen3ASRModel(config, dtype)
     return _load_and_init_model(model, model_path, config_dict)
-
-
-# ===========================================================================
-# Module-level helpers
-# ===========================================================================
-
-
-def _load_qwen3_asr_tokenizer(model_path: str | None = None):
-    """Load a Qwen3-ASR tokenizer (Qwen2Tokenizer via AutoTokenizer).
-
-    Args:
-        model_path: Local model directory with tokenizer files.
-
-    Returns:
-        A tokenizer instance.
-    """
-    if AutoTokenizer is None:
-        raise ImportError("Qwen3-ASR tokenizer requires transformers to be installed.")
-
-    if model_path:
-        try:
-            return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        except (OSError, ValueError) as e:
-            logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
-
-    raise ValueError(
-        "Qwen3-ASR requires a local tokenizer. "
-        "Provide a model_path with tokenizer files."
-    )
 
 
 # ===========================================================================

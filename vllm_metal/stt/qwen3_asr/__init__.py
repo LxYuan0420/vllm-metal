@@ -12,6 +12,7 @@ from .model import (
     _get_cnn_output_lengths,
     _get_feat_extract_output_lengths,
 )
+from .transcriber import Qwen3ASRTranscriber
 
 __all__ = [
     "AudioEncoder",
@@ -19,6 +20,7 @@ __all__ = [
     "Qwen3ASRConfig",
     "Qwen3ASRModel",
     "Qwen3ASRTextConfig",
+    "Qwen3ASRTranscriber",
     "Qwen3Attention",
     "Qwen3LM",
     "_get_cnn_output_lengths",
