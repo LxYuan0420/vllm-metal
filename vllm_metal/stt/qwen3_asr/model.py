@@ -186,7 +186,7 @@ class AudioEncoderLayer(nn.Module):
         return x
 
 
-def _get_cnn_output_lengths(input_lengths: int | mx.array) -> int | mx.array:
+def get_cnn_output_lengths(input_lengths: int | mx.array) -> int | mx.array:
     """Compute output length after 3x Conv2d(stride=2)."""
     lengths = input_lengths
     for _ in range(3):
@@ -194,7 +194,7 @@ def _get_cnn_output_lengths(input_lengths: int | mx.array) -> int | mx.array:
     return lengths
 
 
-def _get_feat_extract_output_lengths(input_lengths: int, n_window: int = 50) -> int:
+def get_feat_extract_output_lengths(input_lengths: int, n_window: int = 50) -> int:
     """Total audio token count for a mel with given number of time frames.
 
     Accounts for chunking into windows of ``n_window * 2`` and 3x Conv2d
@@ -205,12 +205,12 @@ def _get_feat_extract_output_lengths(input_lengths: int, n_window: int = 50) -> 
         n_window: Window size from audio config (default: 50).
     """
     chunk_size = n_window * 2
-    frames_per_full_chunk = _get_cnn_output_lengths(chunk_size)
+    frames_per_full_chunk = get_cnn_output_lengths(chunk_size)
     remainder = input_lengths % chunk_size
     full_chunks = input_lengths // chunk_size
     if remainder == 0:
         return int(full_chunks * frames_per_full_chunk)
-    remainder_out = _get_cnn_output_lengths(remainder)
+    remainder_out = get_cnn_output_lengths(remainder)
     return int(full_chunks * frames_per_full_chunk + remainder_out)
 
 
@@ -324,7 +324,7 @@ class AudioEncoder(nn.Module):
         x = x + pos.astype(x.dtype)
 
         # Compute valid lengths after CNN per chunk
-        cnn_lengths = [_get_cnn_output_lengths(cl) for cl in chunk_lengths]
+        cnn_lengths = [get_cnn_output_lengths(cl) for cl in chunk_lengths]
 
         # Extract valid frames per chunk
         valid = [x[i, : cnn_lengths[i], :] for i in range(n_chunks)]

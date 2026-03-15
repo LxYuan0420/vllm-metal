@@ -449,7 +449,7 @@ def _make_stub_class():
             stt_config: SpeechToTextConfig,
             model_config: ModelConfig,
         ) -> int | None:
-            from vllm_metal.stt.qwen3_asr import _get_feat_extract_output_lengths
+            from vllm_metal.stt.qwen3_asr import get_feat_extract_output_lengths
 
             # Derive hop_length from WhisperFeatureExtractor defaults
             hop_length = WhisperFeatureExtractor().hop_length
@@ -460,7 +460,7 @@ def _make_stub_class():
             mel_frames = math.ceil(
                 audio_duration_s * stt_config.sample_rate / hop_length
             )
-            return _get_feat_extract_output_lengths(mel_frames, n_window=n_window)
+            return get_feat_extract_output_lengths(mel_frames, n_window=n_window)
 
     # Attach multimodal processor factory to the stub class
     Qwen3ASRStub._processor_factory = _ProcessorFactories(

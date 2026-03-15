@@ -9,8 +9,8 @@ from .model import (
     Qwen3ASRTextConfig,
     Qwen3Attention,
     Qwen3LM,
-    _get_cnn_output_lengths,
-    _get_feat_extract_output_lengths,
+    get_cnn_output_lengths,
+    get_feat_extract_output_lengths,
 )
 from .transcriber import Qwen3ASRTranscriber
 
@@ -23,6 +23,6 @@ __all__ = [
     "Qwen3ASRTranscriber",
     "Qwen3Attention",
     "Qwen3LM",
-    "_get_cnn_output_lengths",
-    "_get_feat_extract_output_lengths",
+    "get_cnn_output_lengths",
+    "get_feat_extract_output_lengths",
 ]
