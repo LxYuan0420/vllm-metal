@@ -17,7 +17,7 @@ import logging
 from transformers.configuration_utils import PretrainedConfig
 
 from vllm_metal.stt.config import get_whisper_languages
-from vllm_metal.stt.qwen3_asr import get_feat_extract_output_lengths
+from vllm_metal.stt.qwen3_asr.config import Qwen3ASRAudioConfig
 
 logger = logging.getLogger(__name__)
 
@@ -459,7 +459,9 @@ def _make_stub_class():
             mel_frames = math.ceil(
                 audio_duration_s * stt_config.sample_rate / hop_length
             )
-            return get_feat_extract_output_lengths(mel_frames, n_window=n_window)
+            return Qwen3ASRAudioConfig(n_window=n_window).feat_extract_output_length(
+                mel_frames
+            )
 
     # Attach multimodal processor factory to the stub class
     Qwen3ASRStub._processor_factory = _ProcessorFactories(
