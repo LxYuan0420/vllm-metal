@@ -8,95 +8,13 @@ HuggingFace and MLX weight formats.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-
-@dataclass
-class WhisperConfig:
-    """Whisper model configuration.
-
-    Supports construction from both HuggingFace and MLX config formats
-    via :meth:`from_dict`.
-    """
-
-    n_mels: int = 80
-    n_audio_ctx: int = 1500
-    n_audio_state: int = 512
-    n_audio_head: int = 8
-    n_audio_layer: int = 6
-    n_vocab: int = 51865
-    n_text_ctx: int = 448
-    n_text_state: int = 512
-    n_text_head: int = 8
-    n_text_layer: int = 6
-
-    @classmethod
-    def from_dict(cls, config: dict) -> WhisperConfig:
-        """Create config from a dictionary.
-
-        Automatically detects HuggingFace format (``d_model``,
-        ``encoder_layers``, etc.) and maps to MLX field names.
-
-        Args:
-            config: Raw config dictionary from ``config.json``.
-
-        Returns:
-            Populated :class:`WhisperConfig` instance.
-        """
-        config = config.copy()
-
-        # HuggingFace format
-        if "d_model" in config or "encoder_layers" in config:
-            return cls(
-                n_mels=config.get("num_mel_bins", 80),
-                n_audio_ctx=config.get("max_source_positions", 1500),
-                n_audio_state=config.get("d_model", 512),
-                n_audio_head=config.get("encoder_attention_heads", 8),
-                n_audio_layer=config.get("encoder_layers", 6),
-                n_vocab=config.get("vocab_size", 51865),
-                n_text_ctx=config.get("max_target_positions", 448),
-                n_text_state=config.get("d_model", 512),
-                n_text_head=config.get("decoder_attention_heads", 8),
-                n_text_layer=config.get("decoder_layers", 6),
-            )
-
-        # MLX format — filter to known fields only
-        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered = {k: v for k, v in config.items() if k in known_fields}
-        return cls(**filtered)
-
-
-# ===========================================================================
-# Positional embeddings
-# ===========================================================================
-
-
-def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> mx.array:
-    """Generate sinusoidal positional embeddings.
-
-    Args:
-        length: Sequence length.
-        channels: Embedding dimension (must be even).
-        max_timescale: Maximum timescale for the sinusoids.
-
-    Returns:
-        Array of shape ``(length, channels)``.
-    """
-    assert channels % 2 == 0
-    log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
-    inv_timescales = mx.exp(-log_timescale_increment * mx.arange(channels // 2))
-    scaled_time = mx.arange(length)[:, None] * inv_timescales[None, :]
-    return mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=1)
-
+from .config import WhisperConfig
 
 # ===========================================================================
 # Attention & transformer blocks
@@ -228,7 +146,7 @@ class AudioEncoder(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
-        self._positional_embedding = sinusoids(n_ctx, n_state).astype(dtype)
+        self._positional_embedding = self.sinusoids(n_ctx, n_state).astype(dtype)
         self.blocks = [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         self.ln_post = nn.LayerNorm(n_state)
 
@@ -246,6 +164,15 @@ class AudioEncoder(nn.Module):
 
         x = self.ln_post(x)
         return x
+
+    @staticmethod
+    def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> mx.array:
+        """Generate sinusoidal positional embeddings."""
+        assert channels % 2 == 0
+        log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
+        inv_timescales = mx.exp(-log_timescale_increment * mx.arange(channels // 2))
+        scaled_time = mx.arange(length)[:, None] * inv_timescales[None, :]
+        return mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=1)
 
 
 class TextDecoder(nn.Module):

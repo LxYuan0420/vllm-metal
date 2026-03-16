@@ -19,18 +19,6 @@ from .config import Qwen3ASRAudioConfig, Qwen3ASRConfig, Qwen3ASRTextConfig
 # ===========================================================================
 
 
-def _sinusoidal_position_embedding(
-    max_len: int, d_model: int, dtype: mx.Dtype = mx.float32
-) -> mx.array:
-    """Generate sinusoidal positional embeddings (non-learned)."""
-    assert d_model % 2 == 0
-    half = d_model // 2
-    log_timescale = math.log(10000.0) / (half - 1)
-    inv_timescales = mx.exp(-log_timescale * mx.arange(half))
-    positions = mx.arange(max_len)[:, None] * inv_timescales[None, :]
-    return mx.concatenate([mx.sin(positions), mx.cos(positions)], axis=1).astype(dtype)
-
-
 class AudioEncoderAttention(nn.Module):
     """Multi-head attention for the audio encoder."""
 
@@ -127,7 +115,7 @@ class AudioEncoder(nn.Module):
         self.conv_out = nn.Linear(conv_out_dim, config.d_model, bias=False)
 
         # Positional embedding (sinusoidal, non-learned)
-        self._positional_embedding = _sinusoidal_position_embedding(
+        self._positional_embedding = self.sinusoidal_position_embedding(
             config.max_source_positions, config.d_model, dtype
         )
 
@@ -225,6 +213,20 @@ class AudioEncoder(nn.Module):
         hidden = nn.gelu(self.proj1(hidden))
         hidden = self.proj2(hidden)
         return hidden  # (total_frames, output_dim)
+
+    @staticmethod
+    def sinusoidal_position_embedding(
+        max_len: int, d_model: int, dtype: mx.Dtype = mx.float32
+    ) -> mx.array:
+        """Generate sinusoidal positional embeddings (non-learned)."""
+        assert d_model % 2 == 0
+        half = d_model // 2
+        log_timescale = math.log(10000.0) / (half - 1)
+        inv_timescales = mx.exp(-log_timescale * mx.arange(half))
+        positions = mx.arange(max_len)[:, None] * inv_timescales[None, :]
+        return mx.concatenate([mx.sin(positions), mx.cos(positions)], axis=1).astype(
+            dtype
+        )
 
 
 # ===========================================================================
