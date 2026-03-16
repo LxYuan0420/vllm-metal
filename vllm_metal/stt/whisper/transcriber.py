@@ -49,8 +49,23 @@ class WhisperTranscriber:
         self.model = model
         self.config = config or SpeechToTextConfig()
         self.tokenizer = (
-            tokenizer if tokenizer is not None else _load_tokenizer(model_path)
+            tokenizer if tokenizer is not None else self.load_tokenizer(model_path)
         )
+
+    @staticmethod
+    def load_tokenizer(model_path: str | None) -> WhisperTokenizer:
+        if model_path:
+            try:
+                return WhisperTokenizer.from_pretrained(model_path)
+            except (OSError, ValueError) as e:
+                logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
+
+        try:
+            return WhisperTokenizer.from_pretrained("openai/whisper-small")
+        except OSError:
+            return WhisperTokenizer.from_pretrained(
+                "openai/whisper-small", local_files_only=True
+            )
 
     def transcribe(
         self,
@@ -277,18 +292,3 @@ class WhisperTranscriber:
         features = self.model.encode(mel)
         mx.eval(features)
         return features
-
-
-def _load_tokenizer(model_path: str | None) -> WhisperTokenizer:
-    if model_path:
-        try:
-            return WhisperTokenizer.from_pretrained(model_path)
-        except (OSError, ValueError) as e:
-            logger.debug("Local tokenizer load failed for %s: %s", model_path, e)
-
-    try:
-        return WhisperTokenizer.from_pretrained("openai/whisper-small")
-    except OSError:
-        return WhisperTokenizer.from_pretrained(
-            "openai/whisper-small", local_files_only=True
-        )

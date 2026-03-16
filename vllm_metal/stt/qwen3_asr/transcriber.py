@@ -27,8 +27,14 @@ class Qwen3ASRTranscriber:
     ) -> None:
         self.model = model
         self.tokenizer = (
-            tokenizer if tokenizer is not None else _load_tokenizer(model_path)
+            tokenizer if tokenizer is not None else self.load_tokenizer(model_path)
         )
+
+    @staticmethod
+    def load_tokenizer(model_path: str | None) -> Any:
+        if not model_path:
+            raise ValueError("Qwen3-ASR requires a local tokenizer model_path.")
+        return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     def greedy_decode_tokens(
         self,
@@ -104,9 +110,3 @@ class Qwen3ASRTranscriber:
             if idx >= 0:
                 text_part = text_part[:idx]
         return text_part.strip()
-
-
-def _load_tokenizer(model_path: str | None) -> Any:
-    if not model_path:
-        raise ValueError("Qwen3-ASR requires a local tokenizer model_path.")
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
