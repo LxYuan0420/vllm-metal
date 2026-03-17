@@ -44,4 +44,3 @@ def get_stt_model_constructor(model_type: str) -> STTModelConstructor:
             f"Unsupported STT model_type: {model_type!r}. "
             "Expected 'whisper' or 'qwen3_asr'."
         ) from None
-
