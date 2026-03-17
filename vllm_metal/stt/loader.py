@@ -10,10 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.stt.qwen3_asr.config import Qwen3ASRConfig
-from vllm_metal.stt.qwen3_asr.model import Qwen3ASRModel
-from vllm_metal.stt.whisper.config import WhisperConfig
-from vllm_metal.stt.whisper.model import WhisperModel
+from vllm_metal.stt.registry import get_stt_model_constructor
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +74,7 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
     """Load an STT model from a local directory or HuggingFace repo.
 
     Auto-detects model type from config.json and dispatches to the
-    appropriate loader (Whisper or Qwen3-ASR).
+    appropriate model constructor.
     """
     if isinstance(model_path, str) and not model_path.strip():
         raise ValueError(
@@ -88,15 +85,9 @@ def load_model(model_path: str | Path, dtype: mx.Dtype = mx.float16):
     config_dict = _read_config(model_path)
     model_type = config_dict.get("model_type", "").lower()
 
-    if model_type == "qwen3_asr":
-        return _load_qwen3_asr_model(model_path, config_dict, dtype)
-    if model_type in ("", "whisper"):
-        # Default to Whisper for backward compatibility
-        return _load_whisper_model(model_path, config_dict, dtype)
-    raise ValueError(
-        f"Unsupported STT model_type: {model_type!r}. "
-        "Expected 'whisper' or 'qwen3_asr'."
-    )
+    model_constructor = get_stt_model_constructor(model_type)
+    model = model_constructor(config_dict, dtype)
+    return _load_and_init_model(model, model_path, config_dict)
 
 
 def _load_and_init_model(model, model_path: Path, config_dict: dict):
@@ -115,19 +106,3 @@ def _load_and_init_model(model, model_path: Path, config_dict: dict):
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model
-
-
-def _load_whisper_model(
-    model_path: Path, config_dict: dict, dtype: mx.Dtype
-) -> WhisperModel:
-    """Load a Whisper model from config and weights."""
-    config = WhisperConfig.from_dict(config_dict)
-    model = WhisperModel(config, dtype)
-    return _load_and_init_model(model, model_path, config_dict)
-
-
-def _load_qwen3_asr_model(model_path: Path, config_dict: dict, dtype: mx.Dtype):
-    """Load a Qwen3-ASR model from config and weights."""
-    config = Qwen3ASRConfig.from_dict(config_dict)
-    model = Qwen3ASRModel(config, dtype)
-    return _load_and_init_model(model, model_path, config_dict)
