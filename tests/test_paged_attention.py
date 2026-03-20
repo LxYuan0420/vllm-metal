@@ -11,8 +11,7 @@ from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     get_context,
-    prepare_decode,
-    prepare_prefill_packed,
+    prepare_unified,
 )
 
 
@@ -34,38 +33,36 @@ class TestPrepare:
     def teardown_method(self):
         clear_context()
 
-    def test_prepare_prefill_single_request(self):
-        # Single request via prepare_prefill_packed
-        prepare_prefill_packed([([10, 11], 5)], block_size=4)
+    def test_prepare_unified_prefill_single(self):
+        # Single prefill request via prepare_unified (start_pos=0)
+        prepare_unified([], [([10, 11], 5, 0)], block_size=4)
         ctx = get_context()
 
         # block 10: slots 40,41,42,43; block 11: slot 44
         assert ctx is not None
-        assert ctx.is_prefill
         assert ctx.slot_mapping == [40, 41, 42, 43, 44]
         assert ctx.block_tables == [[10, 11]]
         assert ctx.context_lens == [5]
         assert ctx.cu_seqlens == [0, 5]
+        assert ctx.offsets == [0]
 
-    def test_prepare_prefill_packed_slot_mapping(self):
-        # Two requests: 3 tokens in block 10, 2 tokens in block 20
-        requests = [([10], 3), ([20], 2)]
-        prepare_prefill_packed(requests, block_size=4)
+    def test_prepare_unified_prefill_packed(self):
+        # Two prefill requests packed together
+        prepare_unified([], [([10], 3, 0), ([20], 2, 0)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
-        assert ctx.is_prefill
         # Request 0: block 10, slots 40,41,42
         # Request 1: block 20, slots 80,81
         assert ctx.slot_mapping == [40, 41, 42, 80, 81]
         assert ctx.cu_seqlens == [0, 3, 5]
         assert ctx.block_tables == [[10], [20]]
         assert ctx.context_lens == [3, 2]
+        assert ctx.offsets == [0, 0]
 
-    def test_prepare_prefill_packed_single_request(self):
-        # Single request through packed path should produce valid metadata
-        requests = [([5, 6], 5)]
-        prepare_prefill_packed(requests, block_size=4)
+    def test_prepare_unified_prefill_multiblock(self):
+        # Single prefill spanning two blocks
+        prepare_unified([], [([5, 6], 5, 0)], block_size=4)
         ctx = get_context()
 
         assert ctx is not None
@@ -75,20 +72,53 @@ class TestPrepare:
         assert ctx.block_tables == [[5, 6]]
         assert ctx.context_lens == [5]
 
-    def test_prepare_decode(self):
-        # Arrange
-        requests = [([5, 6], 7)]
-
-        # Act
-        prepare_decode(requests, block_size=4)
+    def test_prepare_unified_continuation_chunk(self):
+        # Continuation chunk: 3 new tokens starting at position 4
+        # block 10 has slots 40-43 (positions 0-3, already cached),
+        # block 11 has slots 44-47 (positions 4-6 are the new tokens)
+        prepare_unified([], [([10, 11], 3, 4)], block_size=4)
         ctx = get_context()
 
-        # Assert — new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
         assert ctx is not None
-        assert not ctx.is_prefill
+        # Only 3 tokens in the query (positions 4, 5, 6)
+        assert ctx.cu_seqlens == [0, 3]
+        # Slots for positions 4, 5, 6: block 11 slots 44, 45, 46
+        assert ctx.slot_mapping == [44, 45, 46]
+        assert ctx.block_tables == [[10, 11]]
+        # Total context = start_pos + num_tokens = 4 + 3 = 7
+        assert ctx.context_lens == [7]
+        # RoPE offset = start_pos
+        assert ctx.offsets == [4]
+
+    def test_prepare_unified_decode_only(self):
+        # Single decode request via prepare_unified
+        decode_requests = [([5, 6], 7)]
+        prepare_unified(decode_requests, [], block_size=4)
+        ctx = get_context()
+
+        # new_pos=7, block_ids[7//4]=block_ids[1]=6, slot=6*4+(7%4)=27
+        assert ctx is not None
         assert ctx.slot_mapping == [27]
         assert ctx.context_lens == [8]
         assert ctx.offsets == [7]
+        assert ctx.cu_seqlens == [0, 1]
+
+    def test_prepare_unified_mixed(self):
+        # 1 decode + 1 prefill
+        decode_requests = [([5, 6], 7)]  # seq_len=7
+        prefill_requests = [([10, 11], 5, 0)]  # 5 tokens from position 0
+
+        prepare_unified(decode_requests, prefill_requests, block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        # Decode slot: pos=7, block 6, slot=6*4+3=27
+        # Prefill slots: block 10 slots 40,41,42,43; block 11 slot 44
+        assert ctx.slot_mapping == [27, 40, 41, 42, 43, 44]
+        assert ctx.cu_seqlens == [0, 1, 6]
+        assert ctx.offsets == [7, 0]
+        assert ctx.context_lens == [8, 5]
+        assert ctx.block_tables == [[5, 6], [10, 11]]
 
 
 class TestPackedRoPE:

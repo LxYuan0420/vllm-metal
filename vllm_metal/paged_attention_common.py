@@ -5,9 +5,9 @@ Provides the thread-local ``PagedAttentionContext`` and ``OffsetCache`` used by
 both the Metal kernel paged attention backend and the model runner.
 
 Usage:
-    1. Before each forward pass call ``prepare_prefill_packed()`` or ``prepare_decode()``
+    1. Before each forward pass call ``prepare_unified()``
     2. Run ``model(input_ids, cache=offset_caches)`` as normal
-    3. The attention wrapper reads ``get_context()`` to decide prefill vs decode
+    3. The attention wrapper reads ``get_context()`` for paged metadata
     4. Call ``clear_context()`` after the forward pass
 """
 
@@ -26,7 +26,7 @@ from mlx_lm.models.base import create_causal_mask
 # Thread-local storage used to pass per-request metadata (slot_mapping,
 # block_tables, etc.) to attention wrappers buried inside the model.
 # We cannot add extra arguments to the mlx_lm forward signature, so
-# instead: prepare_prefill_packed/decode() stashes context here before the
+# instead: prepare_unified() stashes context here before the
 # forward pass, each attention wrapper reads it via get_context(), and
 # clear_context() cleans up afterwards.
 _thread_local = threading.local()
@@ -34,17 +34,20 @@ _thread_local = threading.local()
 
 @dataclass
 class PagedAttentionContext:
-    """Context set before each forward pass, read by patched attention."""
+    """Context set before each forward pass, read by patched attention.
 
-    is_prefill: bool
+    All forward passes use the varlen kernel with ``cu_seqlens`` to handle
+    variable-length subsequences (both prefill and decode tokens packed
+    into a single flat sequence).
+    """
+
     slot_mapping: list[int]
-    # decode-only fields
     block_tables: list[list[int]] = field(default_factory=list)
     context_lens: list[int] = field(default_factory=list)
+    # Per-segment RoPE offsets: 0 for fresh prefill, seq_len for decode.
     offsets: list[int] = field(default_factory=list)
-    # packed prefill fields — set when multiple requests are packed into
-    # a single forward pass.  cu_seqlens is a cumulative sequence length
-    # array: [0, len0, len0+len1, ...] (length = num_requests + 1).
+    # Cumulative sequence length array: [0, len0, len0+len1, ...]
+    # (length = num_requests + 1).
     cu_seqlens: list[int] | None = None
 
 
@@ -148,78 +151,60 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
 # ---------------------------------------------------------------------------
 
 
-def prepare_prefill_packed(
-    requests: list[tuple[list[int], int]],
+def prepare_unified(
+    decode_requests: list[tuple[list[int], int]],
+    prefill_requests: list[tuple[list[int], int, int]],
     block_size: int,
 ) -> None:
-    """Compute slot_mapping, cu_seqlens, block_tables, context_lens for prefill.
+    """Compute metadata for a unified prefill + decode forward pass.
 
-    Packs one or more prefill requests into a single forward pass.  The
-    varlen Metal kernel uses ``cu_seqlens`` to locate each sequence's
-    query tokens and ``block_tables`` / ``context_lens`` to read K/V
-    from the paged cache.
+    Packs decode tokens (1 per request) followed by prefill tokens into a
+    single flattened sequence.  ``cu_seqlens`` marks request boundaries so
+    the varlen kernel handles both decode (length-1) and prefill (length-N)
+    subsequences in one dispatch.
 
     Args:
-        requests: list of (block_ids, num_tokens) per request.
-        block_size: tokens per block.
+        decode_requests: list of ``(block_ids, seq_len)`` for decode requests.
+            ``seq_len`` = tokens already cached before this step.
+        prefill_requests: list of ``(block_ids, num_tokens, start_pos)`` for
+            prefill.  ``start_pos`` is the position of the first token in this
+            chunk (0 for a fresh prefill, >0 for continuation chunks).
+        block_size: tokens per KV cache block.
     """
     slot_mapping: list[int] = []
     cu_seqlens: list[int] = [0]
     block_tables: list[list[int]] = []
     context_lens: list[int] = []
+    offsets: list[int] = []
 
-    for block_ids, num_tokens in requests:
-        for pos in range(num_tokens):
+    # Decode requests first (1 token each)
+    for block_ids, seq_len in decode_requests:
+        new_pos = seq_len
+        block_idx = block_ids[new_pos // block_size]
+        slot = block_idx * block_size + (new_pos % block_size)
+        slot_mapping.append(slot)
+        cu_seqlens.append(cu_seqlens[-1] + 1)
+        block_tables.append(block_ids)
+        context_lens.append(seq_len + 1)  # including new token
+        offsets.append(seq_len)  # RoPE position
+
+    # Prefill requests (variable tokens each, starting at start_pos)
+    for block_ids, num_tokens, start_pos in prefill_requests:
+        for pos in range(start_pos, start_pos + num_tokens):
             block_idx = block_ids[pos // block_size]
             slot = block_idx * block_size + (pos % block_size)
             slot_mapping.append(slot)
         cu_seqlens.append(cu_seqlens[-1] + num_tokens)
         block_tables.append(block_ids)
-        context_lens.append(num_tokens)
+        context_lens.append(start_pos + num_tokens)
+        offsets.append(start_pos)
 
     set_context(
         PagedAttentionContext(
-            is_prefill=True,
             slot_mapping=slot_mapping,
             block_tables=block_tables,
             context_lens=context_lens,
             cu_seqlens=cu_seqlens,
-        )
-    )
-
-
-def prepare_decode(
-    requests: list[tuple[list[int], int]],
-    block_size: int,
-) -> None:
-    """Compute slot_mapping, block_tables, context_lens, offsets for decode.
-
-    Args:
-        requests: list of (block_ids, seq_len) per request.
-                  seq_len = number of tokens already stored (before this step).
-        block_size: tokens per block
-    """
-    slot_mapping: list[int] = []
-    block_tables: list[list[int]] = []
-    context_lens: list[int] = []
-    offsets: list[int] = []
-
-    for block_ids, seq_len in requests:
-        # Slot for the new token at position seq_len
-        new_pos = seq_len
-        block_idx = block_ids[new_pos // block_size]
-        slot = block_idx * block_size + (new_pos % block_size)
-        slot_mapping.append(slot)
-        block_tables.append(block_ids)
-        context_lens.append(seq_len + 1)  # including new token
-        offsets.append(seq_len)  # RoPE position = seq_len
-
-    set_context(
-        PagedAttentionContext(
-            is_prefill=False,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-            context_lens=context_lens,
             offsets=offsets,
         )
     )
